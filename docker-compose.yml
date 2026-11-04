@@ -1,0 +1,24 @@
+# Monitoring for local development. The gateway itself runs on the host (uvicorn) until Phase 3.
+#   docker compose up -d   ->  Prometheus http://localhost:9090, Grafana http://localhost:3000
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus  # the history lives here, outside the container, so it survives `down`
+    ports: ["9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]  # lets the container reach the gateway on the host (Linux too)
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"  # local only: open the dashboards without logging in
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro  # data source + dashboards as code
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  prometheus-data:  # a named volume: Docker keeps it until `docker compose down -v`

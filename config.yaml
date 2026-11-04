@@ -1,0 +1,30 @@
+# Owned by the platform team. Clients only ever see the names under `models`.
+
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY   # name of the env var, never the key itself
+  ollama:
+    base_url: http://localhost:11434/v1   # local, no key needed
+
+# What a client can ask for -> ordered list of where to try it.
+# Fallback targets are paired by tier (a cheap model falls back to a cheap model).
+models:
+  gpt-4o-mini:
+    - provider: openai
+      model: gpt-4o-mini
+    - provider: ollama
+      model: llama3.2
+  gpt-4o:
+    - provider: openai
+      model: gpt-4o
+
+  # Tier names: clients who don't care about the vendor ask for a tier; we pick the model.
+  fast:
+    - provider: openai
+      model: gpt-4o-mini
+    - provider: ollama
+      model: llama3.2
+  strong:
+    - provider: openai
+      model: gpt-4o
