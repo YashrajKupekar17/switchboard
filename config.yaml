@@ -1,4 +1,8 @@
 # Owned by the platform team. Clients only ever see the names under `models`.
+#
+# A provider's `type` says which API it speaks: "openai" (the default; also Groq, Ollama, vLLM...)
+# or "anthropic" (translated by anthropic_adapter.py). The gateway refuses to start if an
+# `api_key_env` variable is missing, so leave a provider commented out until its key is in .env.
 
 providers:
   openai:
@@ -6,6 +10,13 @@ providers:
     api_key_env: OPENAI_API_KEY   # name of the env var, never the key itself
   ollama:
     base_url: http://localhost:11434/v1   # local, no key needed
+  # groq:                                 # uncomment once GROQ_API_KEY is in .env
+  #   base_url: https://api.groq.com/openai/v1
+  #   api_key_env: GROQ_API_KEY
+  # anthropic:                            # uncomment once ANTHROPIC_API_KEY is in .env
+  #   type: anthropic
+  #   base_url: https://api.anthropic.com/v1
+  #   api_key_env: ANTHROPIC_API_KEY
 
 # What a client can ask for -> ordered list of where to try it.
 # Fallback targets are paired by tier (a cheap model falls back to a cheap model).
@@ -13,18 +24,34 @@ models:
   gpt-4o-mini:
     - provider: openai
       model: gpt-4o-mini
+    # - provider: groq
+    #   model: llama-3.1-8b-instant
+    # - provider: anthropic
+    #   model: claude-haiku-5-5
     - provider: ollama
       model: llama3.2
   gpt-4o:
     - provider: openai
       model: gpt-4o
+    # - provider: anthropic
+    #   model: claude-sonnet-5-5
+    # - provider: groq
+    #   model: llama-3.3-70b-versatile
 
   # Tier names: clients who don't care about the vendor ask for a tier; we pick the model.
   fast:
     - provider: openai
       model: gpt-4o-mini
+    # - provider: groq
+    #   model: llama-3.1-8b-instant
+    # - provider: anthropic
+    #   model: claude-haiku-5-5
     - provider: ollama
       model: llama3.2
   strong:
     - provider: openai
       model: gpt-4o
+    # - provider: anthropic
+    #   model: claude-sonnet-5-5
+    # - provider: groq
+    #   model: llama-3.3-70b-versatile

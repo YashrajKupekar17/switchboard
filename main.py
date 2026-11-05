@@ -118,9 +118,13 @@ async def chat_completions(
                     result.headers["x-gateway-attempts"] = _attempts(failures)
                 return result
 
-            breaker.record_failure(permit)
             ATTEMPTS.labels(target.deployment, result.kind).inc()
             failures.append((target, result))
+            if result.kind == "unsupported":
+                breaker.release(permit)  # never reached the provider: says nothing about its health
+                break
+
+            breaker.record_failure(permit)
             level = logging.ERROR if result.kind == "auth" else logging.WARNING  # auth = our key is broken: alert
             log.log(level, "attempt failed %s/%s kind=%s %s", target.provider.name, target.model, result.kind, result.detail)
 
@@ -138,15 +142,17 @@ def _attempts(failures: list) -> str:
 
 
 def _all_failed(model: str, failures: list) -> JSONResponse:
-    last = failures[-1][1]
+    # A real provider failure outranks "unsupported": a 400 would wrongly blame the client.
+    last = next((f for _, f in reversed(failures) if f.kind != "unsupported"), failures[-1][1])
     headers = {"x-gateway-attempts": _attempts(failures)}
     if last.kind in ("rate_limit", "circuit_open"):
         headers["Retry-After"] = last.retry_after or "1"
+    unsupported = last.kind == "unsupported"
     return JSONResponse(
         status_code=FINAL_STATUS[last.kind],
         content={"error": {
-            "message": f"all providers failed for model {model!r}",
-            "type": "upstream_error",
+            "message": last.detail if unsupported else f"all providers failed for model {model!r}",
+            "type": "invalid_request_error" if unsupported else "upstream_error",
             "attempts": [{"provider": t.provider.name, "kind": f.kind, "detail": f.detail} for t, f in failures],
         }},
         headers=headers,

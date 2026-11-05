@@ -4,6 +4,7 @@ from pathlib import Path
 
 # Must be set before importing main, which loads config at import time.
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
+os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")  # fake: tests never reach Anthropic
 os.environ["GATEWAY_CONFIG"] = str(Path(__file__).parent / "config.test.yaml")
 
 import httpx

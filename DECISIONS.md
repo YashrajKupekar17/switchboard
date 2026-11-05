@@ -327,3 +327,36 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Bucket resolution:** histogram percentiles are estimates *inside* a bucket (the measured p50 1.29 s and p95 1.93 s were both somewhere in the 1–2 s bucket). Add buckets where the distinction matters.
 - **Industry:** vLLM, TGI, and LLM benchmarking tools report TTFT and TPOT (also called *inter-token latency*, ITL) as their main latency numbers.
 - **Production terms:** *TTFT*, *TPOT / ITL*, *prefill vs decode*, *tokens per second*, *bucket resolution*.
+
+## I. More providers: Anthropic adapter, Groq, Ollama
+
+### I1. Providers have a `type`; only Anthropic needs translation
+- **Decision:** each provider in `config.yaml` has `type: openai` (the default) or `type: anthropic`. Anything that speaks OpenAI's API (Groq, Ollama, vLLM, Together, DeepSeek...) needs only config. Anthropic gets an adapter (`anthropic_adapter.py`) that translates the request on the way out and the response or stream on the way back.
+- **Why:** routing, fallback, the breaker and metrics stay unchanged; only the "talk to this provider" step knows about Anthropic. This is the *adapter pattern*.
+- **Alternatives:** Anthropic's own OpenAI-compatible endpoint (no code, but missing features and meant mainly for testing); Anthropic's Python SDK (a second HTTP stack with its own pool, timeouts and retries, which would bypass the timeout and retry policy in F).
+- **Industry:** LiteLLM is essentially a large collection of these adapters, built on plain httpx.
+
+### I2. Request mapping
+- `system`/`developer` messages move to Anthropic's top-level `system` field. `stop` becomes `stop_sequences`, `user` becomes `metadata.user_id`, and `max_completion_tokens`/`max_tokens` become `max_tokens`.
+- **`max_tokens` defaults to 16000** when the client leaves it out (Anthropic requires it). Thinking is on by default on current Claude models and its tokens count toward the cap, so a small default can cut the answer off. The cap doesn't change cost; you pay for tokens generated.
+- **`temperature` and `top_p` are dropped**, and the response says so in `x-gateway-dropped-params`. Current Claude models only accept the default sampling, and API version `2026-10-21` rejects the fields outright. *(Changed from the first proposal, which was to cap temperature at 1: that would still get a 400.)* The cost is that a client asking for `temperature: 0` gets default sampling from Claude.
+- **API version:** `anthropic-version: 2026-10-21`.
+
+### I3. Features Anthropic can't handle: skip the target, don't blame anyone
+- **Decision:** a request with fields the adapter doesn't translate (`tools`, `n` > 1, `logprobs`, `response_format`...) skips the Anthropic target with failure kind `unsupported` and moves to the next one. It **never counts against the breaker** (the provider was never called) and is never retried. If every target was unsupported, the client gets a 400 naming the field. If any target failed for real, that failure decides the status (a 503 from OpenAI is still a 502, not the client's fault).
+- **Alternatives:** silently drop unknown fields (LiteLLM's `drop_params`; a request with `tools` would get an answer that ignores them); always 400 (wrong when another target could handle it).
+- **v2:** translate tool calling.
+
+### I4. Errors
+- 401/403 → `auth`, 429 → `rate_limit`, 500 and **529 `overloaded_error`** → `server`: the same table as F. Anthropic's 4xx error bodies are rewritten into OpenAI's shape (`{"error": {"message", "type", "code"}}`) so clients only parse one format.
+
+### I5. Streaming: translate events, commit at the first content block
+- Anthropic's events (`message_start`, `content_block_start/delta/stop`, `message_delta`, `message_stop`, `ping`, `error`) become OpenAI chunks. Thinking blocks are left out. Input tokens (from `message_start`, including cache reads and writes) and output tokens (from `message_delta`) are combined into the final `usage` chunk, so metrics and cost tracking work unchanged.
+- **Commit point:** nothing reaches the client until the model starts its first content block. Anthropic can send `message_start` and then report `overloaded_error` inside the 200 stream; because we haven't committed, that still falls back. *Production term:* *in-band errors*. TrueFoundry calls the same idea a "first-chunk gate".
+- **Why the first content block, not the first text:** with thinking on, text can start long after our 10 s first-chunk timeout, which would cause needless fallbacks that cost money.
+- **After the commit point** an `error` event, or a stream that ends without `message_stop`, sends our usual error event with no `[DONE]` (D-section).
+
+### I6. Groq and Ollama: config only
+- Groq (`https://api.groq.com/openai/v1`, `llama-3.1-8b-instant` / `llama-3.3-70b-versatile`) and Ollama need no code. Fallback chains pair by tier: `gpt-4o-mini` → Groq 8B → Claude Haiku 5.5 → local Llama; `gpt-4o` → Claude Sonnet 5.5 → Groq 70B.
+- **Not verified for real yet:** no Groq or Anthropic key, and Ollama isn't installed. Their config entries are commented out because the gateway refuses to start when a configured key is missing (C-section). Tests use a fake Anthropic built from Anthropic's documented formats.
+- **Read (only if needed):** Anthropic, "Streaming Messages" (platform.claude.com/docs/en/build-with-claude/streaming); "Migrating to API version 2026-10-21" (platform.claude.com/docs/en/api/migration-2026-10-21).

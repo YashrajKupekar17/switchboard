@@ -4,18 +4,25 @@ from typing import Optional
 
 import yaml
 
+PROVIDER_TYPES = ("openai", "anthropic")  # "openai" = anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM...)
+ANTHROPIC_VERSION = "2026-10-21"
+
 
 @dataclass(frozen=True)
 class Provider:
     name: str
     base_url: str
     api_key: Optional[str]
+    type: str = "openai"
 
     @property
     def chat_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}/chat/completions"
+        path = "messages" if self.type == "anthropic" else "chat/completions"
+        return f"{self.base_url.rstrip('/')}/{path}"
 
     def headers(self) -> dict:
+        if self.type == "anthropic":
+            return {"x-api-key": self.api_key or "", "anthropic-version": ANTHROPIC_VERSION}
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
 
@@ -49,7 +56,10 @@ def load_config(path: str) -> Config:
             if not api_key:
                 # Fail at startup, not on the first request at 3am.
                 raise RuntimeError(f"provider {name!r}: env var {p['api_key_env']} is not set")
-        providers[name] = Provider(name=name, base_url=p["base_url"], api_key=api_key)
+        ptype = p.get("type", "openai")
+        if ptype not in PROVIDER_TYPES:
+            raise RuntimeError(f"provider {name!r}: unknown type {ptype!r}, expected one of {PROVIDER_TYPES}")
+        providers[name] = Provider(name=name, base_url=p["base_url"], api_key=api_key, type=ptype)
 
     models = {}
     for alias, targets in raw["models"].items():

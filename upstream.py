@@ -4,6 +4,8 @@ The policy (see DESIGN.md section 4):
   request errors (400...)  -> return to client as-is, never fall back
   401/403, 429, 5xx, connect errors, read timeouts -> provider problem -> try the next target
   only the last target gets one retry, and only when nothing was sent (5xx, connect errors)
+
+Providers with `type: anthropic` are translated to and from OpenAI's format here (anthropic_adapter.py).
 """
 import asyncio
 import json
@@ -16,6 +18,8 @@ import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+import anthropic_adapter
+from anthropic_adapter import StreamError, Unsupported
 from config import Target
 from metrics import ATTEMPTS, TPOT, TTFT, record_usage
 
@@ -32,12 +36,13 @@ RETRYABLE = {"server", "connect"}
 FINAL_STATUS = {
     "auth": 502, "rate_limit": 503, "server": 502, "connect": 502, "network": 502, "timeout": 504,
     "circuit_open": 503,  # we skipped it ourselves; Retry-After says when the next trial is
+    "unsupported": 400,  # no target could handle the request's features (e.g. tools on an Anthropic-only model)
 }
 
 
 @dataclass
 class Failure:
-    kind: str  # "auth" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open"
+    kind: str  # "auth" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open" | "unsupported"
     detail: str
     retry_after: Optional[str] = None
 
@@ -66,6 +71,14 @@ async def call_target(
 ) -> Union[Response, Failure]:
     payload = {**payload, "model": target.model}  # the provider's own name for the model
     headers = {"x-gateway-provider": target.provider.name}
+    is_anthropic = target.provider.type == "anthropic"
+    if is_anthropic:
+        try:
+            payload, dropped = anthropic_adapter.to_anthropic(payload)
+        except Unsupported as exc:
+            return Failure("unsupported", str(exc))  # skip this target; another one may handle it
+        if dropped:
+            headers["x-gateway-dropped-params"] = ",".join(dropped)  # tell the client, don't hide it
     if stream:
         return await _call_stream(http, target, payload, headers)
 
@@ -79,7 +92,11 @@ async def call_target(
     kind = classify_status(upstream.status_code)
     if kind:
         return Failure(kind, f"HTTP {upstream.status_code}", upstream.headers.get("retry-after"))
-    body = upstream.json()
+    if is_anthropic:
+        body = anthropic_adapter.from_anthropic(upstream.json()) if upstream.is_success else (
+            anthropic_adapter.error_to_openai(upstream.content))
+    else:
+        body = upstream.json()
     if upstream.is_success:
         record_usage(target.deployment, body.get("usage"))
     return JSONResponse(status_code=upstream.status_code, content=body, headers=headers)
@@ -97,12 +114,16 @@ async def _call_stream(http: httpx.AsyncClient, target: Target, payload: dict, h
         return classify_exception(exc)
     except StopAsyncIteration:
         return Failure("network", "stream closed before first chunk")
+    except StreamError as exc:  # an error inside the 200 stream, before we committed: still safe to fall back
+        return Failure(exc.kind, str(exc))
 
     if error_body is not None:
         kind = classify_status(upstream.status_code)
         if kind:
             return Failure(kind, f"HTTP {upstream.status_code}", upstream.headers.get("retry-after"))
-        return JSONResponse(status_code=upstream.status_code, content=json.loads(error_body), headers=headers)
+        is_anthropic = target.provider.type == "anthropic"
+        content = anthropic_adapter.error_to_openai(error_body) if is_anthropic else json.loads(error_body)
+        return JSONResponse(status_code=upstream.status_code, content=content, headers=headers)
 
     # First chunk is in hand: only now do we commit to this provider and send 200 to the client.
     lines, buffered = first
@@ -127,6 +148,8 @@ async def _open_stream(http: httpx.AsyncClient, target: Target, payload: dict):
             return upstream, body, None
 
         lines = upstream.aiter_lines()
+        if target.provider.type == "anthropic":
+            lines = anthropic_adapter.translate_stream(lines)  # from here on, every line is OpenAI-format
         buffered = []
         while True:
             line = await lines.__anext__()  # StopAsyncIteration if the stream ends with no data
@@ -159,7 +182,7 @@ async def relay_stream(lines, started: float, deployment: str):
                 if chunk.get("usage"):
                     usage = chunk["usage"]
             yield line + "\n"
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, StreamError) as exc:
         # Provider died mid-stream. The 200 and some chunks are already sent, so we can't fall back.
         # Send an error event (the OpenAI SDK raises APIError on it) so the client knows the answer is incomplete.
         log.warning("upstream failed mid-stream: %r", exc)

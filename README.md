@@ -59,6 +59,14 @@ models:
       model: gpt-4o-mini
 ```
 
+**Several providers, one format.** Anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM) needs only a config entry. Anthropic speaks a different API, so `anthropic_adapter.py` translates the request on the way out and the response or stream on the way back. Clients never notice that their request was answered by Claude. Some details that come up when translating:
+
+- Claude doesn't support some request features, like `tools`. When a request uses one, switchboard skips Claude and tries the next provider. This doesn't count against Claude's circuit breaker, since nothing is wrong with Claude.
+- Current Claude models reject custom `temperature` and `top_p`, so switchboard drops them and names them in an `x-gateway-dropped-params` response header.
+- Anthropic can return a 200 and then report "overloaded" inside the stream. switchboard holds the stream until the model starts its first content block, so it can still fall back if that happens.
+
+Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven't run them against the real APIs yet.
+
 **Fallback and retries.** The rule is to fall back only when the problem is the provider's, never the client's:
 
 | What happened | What switchboard does |

@@ -4,6 +4,10 @@ providers:
     api_key_env: OPENAI_API_KEY
   ollama:
     base_url: http://ollama.test/v1
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
 
 models:
   gpt-4o-mini:
@@ -19,3 +23,16 @@ models:
   local-small:
     - provider: ollama
       model: llama3.2
+  claude-small:
+    - provider: anthropic
+      model: claude-haiku-5-5
+  claude-then-ollama:
+    - provider: anthropic
+      model: claude-haiku-5-5
+    - provider: ollama
+      model: llama3.2
+  openai-then-claude:
+    - provider: openai
+      model: gpt-4o-mini
+    - provider: anthropic
+      model: claude-haiku-5-5
