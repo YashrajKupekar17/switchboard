@@ -6,7 +6,7 @@ import pytest
 import respx
 
 import upstream
-from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, FAKE_SSE, OLLAMA_URL, OPENAI_URL, client  # noqa: F401
+from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, FAKE_SSE, OLLAMA_URL, OPENAI_URL
 
 OFF = {"x-gateway-fallback": "off"}
 
@@ -177,3 +177,17 @@ def test_stream_falls_back_when_first_chunk_is_too_slow(client, monkeypatch):
     assert resp.status_code == 200  # the 200 was never sent for openai, so switching was still possible
     assert resp.headers["x-gateway-provider"] == "ollama"
     assert resp.headers["x-gateway-attempts"] == "openai:timeout"
+
+
+@respx.mock
+def test_provider_404_is_our_config_error_so_it_falls_back(client):
+    # Found for real: Groq retired a model ID our config still used. The client asked for a valid gateway model.
+    respx.post(OPENAI_URL).mock(return_value=httpx.Response(
+        404, json={"error": {"message": "model does not exist", "code": "model_not_found"}}
+    ))
+    respx.post(OLLAMA_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+
+    resp = client.post("/v1/chat/completions", json=CHAT_BODY)
+
+    assert resp.status_code == 200
+    assert resp.headers["x-gateway-attempts"] == "openai:config"

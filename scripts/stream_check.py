@@ -1,11 +1,12 @@
 """Streams a real answer through the gateway with the official OpenAI SDK and prints tokens as they arrive."""
+import os
 import sys
 import time
 
 from openai import OpenAI
 
 base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000/v1"
-client = OpenAI(base_url=base_url, api_key="not-checked-yet")
+client = OpenAI(base_url=base_url, api_key=os.environ["SWITCHBOARD_API_KEY"])  # an sbk_ key from scripts/keys.py
 
 start = time.perf_counter()
 first = None

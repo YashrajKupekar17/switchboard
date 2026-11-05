@@ -1,10 +1,11 @@
 """Proves the gateway is a drop-in replacement: the official OpenAI SDK, only base_url changed."""
+import os
 import sys
 
 from openai import OpenAI
 
 base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000/v1"
-client = OpenAI(base_url=base_url, api_key="not-checked-yet")  # gateway auth comes in Phase 3
+client = OpenAI(base_url=base_url, api_key=os.environ["SWITCHBOARD_API_KEY"])  # an sbk_ key from scripts/keys.py
 
 resp = client.chat.completions.create(
     model="gpt-4o-mini",

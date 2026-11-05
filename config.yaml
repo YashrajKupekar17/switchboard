@@ -10,9 +10,9 @@ providers:
     api_key_env: OPENAI_API_KEY   # name of the env var, never the key itself
   ollama:
     base_url: http://localhost:11434/v1   # local, no key needed
-  # groq:                                 # uncomment once GROQ_API_KEY is in .env
-  #   base_url: https://api.groq.com/openai/v1
-  #   api_key_env: GROQ_API_KEY
+  groq:
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
   # anthropic:                            # uncomment once ANTHROPIC_API_KEY is in .env
   #   type: anthropic
   #   base_url: https://api.anthropic.com/v1
@@ -24,8 +24,8 @@ models:
   gpt-4o-mini:
     - provider: openai
       model: gpt-4o-mini
-    # - provider: groq
-    #   model: llama-3.1-8b-instant
+    - provider: groq
+      model: openai/gpt-oss-20b
     # - provider: anthropic
     #   model: claude-haiku-5-5
     - provider: ollama
@@ -35,15 +35,15 @@ models:
       model: gpt-4o
     # - provider: anthropic
     #   model: claude-sonnet-5-5
-    # - provider: groq
-    #   model: llama-3.3-70b-versatile
+    - provider: groq
+      model: openai/gpt-oss-120b
 
   # Tier names: clients who don't care about the vendor ask for a tier; we pick the model.
   fast:
     - provider: openai
       model: gpt-4o-mini
-    # - provider: groq
-    #   model: llama-3.1-8b-instant
+    - provider: groq
+      model: openai/gpt-oss-20b
     # - provider: anthropic
     #   model: claude-haiku-5-5
     - provider: ollama
@@ -53,5 +53,5 @@ models:
       model: gpt-4o
     # - provider: anthropic
     #   model: claude-sonnet-5-5
-    # - provider: groq
-    #   model: llama-3.3-70b-versatile
+    - provider: groq
+      model: openai/gpt-oss-120b

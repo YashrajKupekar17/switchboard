@@ -1,5 +1,5 @@
-# Monitoring for local development. The gateway itself runs on the host (uvicorn) until Phase 3.
-#   docker compose up -d   ->  Prometheus http://localhost:9090, Grafana http://localhost:3000
+# Local development services. The gateway itself still runs on the host (uvicorn).
+#   docker compose up -d   ->  Prometheus :9090, Grafana :3000, Postgres :5432
 services:
   prometheus:
     image: prom/prometheus:v3.5.0
@@ -20,5 +20,16 @@ services:
     ports: ["3000:3000"]
     depends_on: [prometheus]
 
+  postgres:
+    image: postgres:17.5
+    environment:  # local development only; real deployments use a secrets manager
+      POSTGRES_USER: switchboard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-switchboard}
+      POSTGRES_DB: switchboard
+    volumes:
+      - postgres-data:/var/lib/postgresql/data  # keys and spend must survive restarts
+    ports: ["127.0.0.1:5432:5432"]  # reachable from this machine only
+
 volumes:
   prometheus-data:  # a named volume: Docker keeps it until `docker compose down -v`
+  postgres-data:

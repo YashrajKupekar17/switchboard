@@ -7,12 +7,13 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 
 from breaker import Breakers
+import keys
 from config import load_config
 from metrics import ATTEMPTS, FALLBACKS, RequestMetrics
 from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
@@ -42,17 +43,55 @@ class ChatRequest(BaseModel):
     stream: bool = False
 
 
+async def open_key_store():
+    # Required: without a key store nobody can be authenticated, so fail at startup, not on the first request.
+    return await keys.connect(os.environ["DATABASE_URL"])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # One shared client for the whole app = one connection pool, reused by every request.
     app.state.http = httpx.AsyncClient()
     app.state.breakers = Breakers()  # in this process's memory, by design (DECISIONS.md G4)
+    app.state.key_store = await open_key_store()
+    app.state.keys = keys.KeyCache(app.state.key_store)  # in-process cache in front of Postgres (J2)
     yield
     await app.state.http.aclose()
+    await app.state.key_store.close()
 
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(RequestMetrics)
+
+
+class AuthError(Exception):
+    def __init__(self, status: int, message: str, code: str):
+        self.status, self.message, self.code = status, message, code
+
+
+@app.exception_handler(AuthError)
+async def auth_error(request: Request, exc: AuthError):
+    # Same shape and code as OpenAI's own 401, so SDKs raise their usual AuthenticationError.
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": {"message": exc.message, "type": "invalid_request_error", "code": exc.code}},
+    )
+
+
+async def require_key(request: Request, authorization: Optional[str] = Header(default=None)) -> keys.KeyInfo:
+    """First step of every request: which team is calling? (DECISIONS.md J)"""
+    scheme, _, key = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not key:
+        raise AuthError(401, "missing API key: send 'Authorization: Bearer sbk_...'", "missing_api_key")
+    try:
+        info = await request.app.state.keys.check(key.strip())
+    except keys.AuthUnavailable as exc:
+        log.error("key lookup failed, rejecting request: %s", exc)  # fail closed: never let unknown keys in
+        raise AuthError(503, "authentication is temporarily unavailable", "auth_unavailable")
+    if info is None:
+        raise AuthError(401, "invalid or revoked API key", "invalid_api_key")
+    request.state.team = info.team
+    return info
 
 
 @app.get("/healthz")
@@ -68,7 +107,10 @@ def metrics():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
-    request: ChatRequest, http_request: Request, x_gateway_fallback: Optional[str] = Header(default=None)
+    request: ChatRequest,
+    http_request: Request,
+    caller: keys.KeyInfo = Depends(require_key),
+    x_gateway_fallback: Optional[str] = Header(default=None),
 ):
     targets = CONFIG.models.get(request.model)
     # Only configured names become a label: clients can send any string, and each one would be a new time series.
@@ -113,7 +155,7 @@ async def chat_completions(
                 ATTEMPTS.labels(target.deployment, "ok").inc()
                 if i > 0:
                     FALLBACKS.labels(request.model).inc()
-                log.info("route model=%s -> %s/%s", request.model, target.provider.name, target.model)
+                log.info("route team=%s model=%s -> %s/%s", caller.team, request.model, target.provider.name, target.model)
                 if failures:
                     result.headers["x-gateway-attempts"] = _attempts(failures)
                 return result
@@ -125,7 +167,7 @@ async def chat_completions(
                 break
 
             breaker.record_failure(permit)
-            level = logging.ERROR if result.kind == "auth" else logging.WARNING  # auth = our key is broken: alert
+            level = logging.ERROR if result.kind in ("auth", "config") else logging.WARNING  # our own setup is broken: alert
             log.log(level, "attempt failed %s/%s kind=%s %s", target.provider.name, target.model, result.kind, result.detail)
 
             # With another target available, move on immediately. On the last one, retry once if it's safe.

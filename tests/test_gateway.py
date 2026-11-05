@@ -1,18 +1,11 @@
 import json
 import os
-from pathlib import Path
-
-# Must be set before importing main, which loads config at import time.
-os.environ.setdefault("OPENAI_API_KEY", "test-key")
-os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")  # fake: tests never reach Anthropic
-os.environ["GATEWAY_CONFIG"] = str(Path(__file__).parent / "config.test.yaml")
 
 import httpx
 import pytest
 import respx
-from fastapi.testclient import TestClient
 
-from main import app
+from tests.conftest import TEST_KEY
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 OLLAMA_URL = "http://ollama.test/v1/chat/completions"
@@ -26,12 +19,6 @@ FAKE_COMPLETION = {
     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
     "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
 }
-
-
-@pytest.fixture
-def client():
-    with TestClient(app) as c:  # `with` runs lifespan, so the shared httpx client exists
-        yield c
 
 
 @respx.mock
@@ -141,7 +128,7 @@ def test_openai_sdk_raises_on_mid_stream_failure(client):
 
     respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, stream=BreaksMidStream()))
     respx.route(host="testserver").pass_through()  # let the SDK reach our app via TestClient
-    sdk = OpenAI(base_url="http://testserver/v1", api_key="x", http_client=client)
+    sdk = OpenAI(base_url="http://testserver/v1", api_key=TEST_KEY, http_client=client)
 
     received = []
     with pytest.raises(APIError, match="mid-stream"):

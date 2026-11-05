@@ -34,7 +34,7 @@ RETRYABLE = {"server", "connect"}
 
 # What the client gets when every target failed, keyed by the last failure's kind.
 FINAL_STATUS = {
-    "auth": 502, "rate_limit": 503, "server": 502, "connect": 502, "network": 502, "timeout": 504,
+    "auth": 502, "config": 502, "rate_limit": 503, "server": 502, "connect": 502, "network": 502, "timeout": 504,
     "circuit_open": 503,  # we skipped it ourselves; Retry-After says when the next trial is
     "unsupported": 400,  # no target could handle the request's features (e.g. tools on an Anthropic-only model)
 }
@@ -42,7 +42,7 @@ FINAL_STATUS = {
 
 @dataclass
 class Failure:
-    kind: str  # "auth" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open" | "unsupported"
+    kind: str  # "auth" | "config" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open" | "unsupported"
     detail: str
     retry_after: Optional[str] = None
 
@@ -51,6 +51,8 @@ def classify_status(status: int) -> Optional[str]:
     """Failure kind for a provider status code, or None if the response should go to the client as-is."""
     if status in (401, 403):
         return "auth"  # our provider key is broken: the platform's fault, not the client's
+    if status == 404:
+        return "config"  # the provider doesn't know the model ID in our config.yaml: our fault, not the client's
     if status == 429:
         return "rate_limit"
     if status >= 500:

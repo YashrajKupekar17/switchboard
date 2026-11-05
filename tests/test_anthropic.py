@@ -6,7 +6,8 @@ import pytest
 import respx
 
 from anthropic_adapter import DEFAULT_MAX_TOKENS, Unsupported, to_anthropic
-from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, OLLAMA_URL, OPENAI_URL, client  # noqa: F401
+from tests.conftest import TEST_KEY
+from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, OLLAMA_URL, OPENAI_URL
 from tests.test_metrics import Delta
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -187,7 +188,7 @@ def test_openai_sdk_streams_from_anthropic_unchanged(client):
 
     respx.post(ANTHROPIC_URL).mock(return_value=anthropic_stream(FULL_STREAM))
     respx.route(host="testserver").pass_through()
-    sdk = OpenAI(base_url="http://testserver/v1", api_key="x", http_client=client)
+    sdk = OpenAI(base_url="http://testserver/v1", api_key=TEST_KEY, http_client=client)
 
     chunks = list(sdk.chat.completions.create(stream=True, **CLAUDE_BODY))
 

@@ -4,7 +4,7 @@ import pytest
 import respx
 
 from breaker import CLOSED, HALF_OPEN, NORMAL, OPEN, TRIAL, Breakers, CircuitBreaker
-from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, OLLAMA_URL, OPENAI_URL, client  # noqa: F401
+from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, OLLAMA_URL, OPENAI_URL
 
 
 class FakeClock:

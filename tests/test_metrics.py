@@ -4,7 +4,7 @@ import respx
 from prometheus_client import REGISTRY
 
 from breaker import Breakers
-from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, FAKE_SSE, OLLAMA_URL, OPENAI_URL, client  # noqa: F401
+from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, FAKE_SSE, OLLAMA_URL, OPENAI_URL
 
 
 def value(name, **labels):
