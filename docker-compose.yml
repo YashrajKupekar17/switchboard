@@ -1,6 +1,37 @@
-# Local development services. The gateway itself still runs on the host (uvicorn).
-#   docker compose up -d   ->  Prometheus :9090, Grafana :3000, Postgres :5432, Redis :6379
+# The whole system on one machine.
+#   docker compose up -d --build   ->  gateway on :8000 (3 copies behind nginx), Grafana :3000, Prometheus :9090
 services:
+  lb:
+    image: nginx:1.30.6-alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8000:8000"]  # the only way in: clients never talk to a gateway copy directly
+    depends_on: [gateway]
+
+  gateway:
+    build: .
+    image: switchboard:dev
+    deploy:
+      replicas: 3  # keep in sync with rate_limits.gateway_copies in config.yaml
+    env_file: .env  # provider API keys. In production these come from a secrets manager instead.
+    environment:  # these override .env, which points at localhost for scripts run on the host
+      DATABASE_URL: postgresql://gateway:${GATEWAY_DB_PASSWORD:-gateway}@postgres:5432/switchboard
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db-setup: {condition: service_completed_successfully}
+      redis: {condition: service_started}
+    # No ports: only reachable inside Docker's network, through lb.
+
+  db-setup:  # runs once, as the database owner, then exits: tables, and the restricted `gateway` user
+    image: switchboard:dev
+    build: .
+    command: ["python", "scripts/setup_db.py"]
+    environment:
+      DATABASE_URL: postgresql://switchboard:${POSTGRES_PASSWORD:-switchboard}@postgres:5432/switchboard
+      GATEWAY_DB_PASSWORD: ${GATEWAY_DB_PASSWORD:-gateway}
+    depends_on:
+      postgres: {condition: service_healthy}
+
   prometheus:
     image: prom/prometheus:v3.5.0
     volumes:
@@ -8,7 +39,6 @@ services:
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus  # the history lives here, outside the container, so it survives `down`
     ports: ["9090:9090"]
-    extra_hosts: ["host.docker.internal:host-gateway"]  # lets the container reach the gateway on the host (Linux too)
 
   grafana:
     image: grafana/grafana:12.1.0
@@ -29,7 +59,12 @@ services:
       POSTGRES_DB: switchboard
     volumes:
       - postgres-data:/var/lib/postgresql/data  # keys and spend must survive restarts
-    ports: ["127.0.0.1:5432:5432"]  # reachable from this machine only
+    ports: ["127.0.0.1:5432:5432"]  # reachable from this machine only, for scripts/keys.py
+    healthcheck:  # db-setup waits for this, not just for the container to start
+      test: ["CMD", "pg_isready", "-U", "switchboard"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
   redis:
     image: redis:8.6.8

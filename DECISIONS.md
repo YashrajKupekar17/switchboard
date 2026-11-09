@@ -509,3 +509,57 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Tests** (13 budget tests, 7 pricing tests) use fakeredis and a fake ledger.
 - **Checked for real:** Postgres, Redis and OpenAI, with a $0.00001 soft budget and a $0.00003 max. Each "Say hi" cost 4 micro-dollars (9 input + 5 output tokens on gpt-4o-mini). The spend header climbed 0 → 4 → 8 … → 28 µ$, the warning was logged once at 12 µ$, and request 9 got 429 at 32 µ$, overshooting by one request as expected.
 - **Bug the real test found:** Postgres's `SUM()` of a `BIGINT` returns a `NUMERIC`, which asyncpg turns into a `Decimal`, and Redis refused to store it. The fake ledger returned an `int`, so the tests couldn't see this. Fail open did its job: all 10 requests still landed in the ledger. The fix is to convert to `int`. **Lesson:** a fake can hide the real driver's types. That's why each phase also gets a real run.
+
+## M. Running everything in Docker (Phase 3d)
+
+### M1. One image, many copies
+- **Decision:** a `Dockerfile` builds the gateway image (`python:3.12.16-slim`, 256 MB). Compose runs it with `replicas: 3`. Each container runs **one uvicorn process**; to scale, you run more containers, not more processes per container. That way each copy is one thing to health-check, restart and count, which is how Kubernetes and ECS expect it.
+- **Details that matter:**
+  - **Dependencies are copied and installed before the code,** so Docker reuses that layer and a code change rebuilds in seconds (*layer caching*).
+  - **The process runs as a non-root user** (`app`), so a break-in doesn't get root in the container.
+  - **`.dockerignore` keeps `.env` out of the image.** Secrets are passed in at runtime with `env_file`; production would use a secrets manager.
+  - **`HEALTHCHECK` calls `/healthz`,** so `docker compose ps` shows `healthy` or `unhealthy`.
+  - **`CMD` is in exec form,** so uvicorn is process 1 and gets `docker stop`'s SIGTERM directly. It stops taking new requests and finishes the ones in flight (*graceful shutdown*).
+- **Production terms:** *container image*, *immutable artifact*, *horizontal scaling*, *replica*, *graceful shutdown*, *SIGTERM*, *health check*, *layer caching*.
+
+### M2. nginx in front, round-robin
+- **Decision:** `nginx:1.30.6-alpine` is the only published port (`:8000`). The gateway copies have no ports of their own and are reachable only on Docker's internal network.
+- **How it finds the copies:** Docker's DNS returns one address per copy for the name `gateway`. `server gateway:8000 resolve` re-asks every 5 s, so restarted copies with new IPs are picked up. Requests go round-robin.
+- **Settings that matter for an LLM gateway:**
+  - **`proxy_buffering off`:** otherwise nginx collects the whole stream and sends it at the end, which defeats streaming.
+  - **`proxy_read_timeout 120s`:** longer than the gateway's own 60 s provider timeout, so the gateway, not nginx, decides when to give up.
+  - **`keepalive 32`:** reuses connections to the copies.
+  - **`/metrics` returns 404 from outside (J3).**
+- **When a copy dies:** nginx gets "connection refused" and tries the request on another copy. It does this only when the request never reached a gateway, so a POST is never sent twice.
+- **Why nginx:** it's simple and everywhere. Kubernetes would give the same thing with a Service and an Ingress. Envoy or HAProxy would also work.
+- **Production terms:** *reverse proxy*, *load balancer*, *round-robin*, *service discovery*, *DNS-based discovery*, *upstream keepalive*.
+
+### M3. Least privilege in Postgres
+- **Decision:** two database logins.
+  - **`switchboard`**, the owner, is used by `scripts/setup_db.py` and `scripts/keys.py`.
+  - **`gateway`** is used by the running copies, and can only do: `SELECT` on `api_keys`; `SELECT, INSERT` on `usage_ledger`; and use the ledger's ID sequence.
+- **Why:** this is the fix for the question "if someone can write to the database, what's the point of hashing?" A hacked gateway can't add a key, un-revoke one, change or delete ledger rows, or create tables. We checked: each of those returned `permission denied` as the `gateway` user.
+- **Schema setup moved out of gateway startup** into `scripts/setup_db.py`, since `gateway` isn't allowed to create tables. It runs as a one-off `db-setup` container, and the gateway copies wait for it to exit successfully (`service_completed_successfully`). Postgres gets a `pg_isready` health check so setup waits for a database that is actually ready, not just a started container. The gateway checks at startup that its tables exist and refuses to start with a clear message if they don't.
+- **The script can run again safely:** `CREATE ... IF NOT EXISTS`, and the role is only created if it's missing. The password is quoted with Postgres's own `format('%L')`, since DDL can't take `$1` parameters.
+- **In production:** the owner wouldn't be a superuser, passwords would come from a secrets manager, and the setup step would be a migration tool (Alembic) run by the deploy pipeline.
+- **Production terms:** *least privilege*, *GRANT*, *separation of duties*, *migration job*, *init container*.
+
+### M4. Prometheus scrapes each copy, not the load balancer
+- **Decision:** `dns_sd_configs` on the name `gateway` gives Prometheus one target per copy. Through the load balancer, each scrape would hit a random copy, and counters would jump between three different values.
+- **Dashboards changed for several copies:**
+  - most panels already add copies up with `sum`;
+  - breakers are per copy (G4), so the panel shows *how many copies* have a breaker open;
+  - budget gauges use `max by (team)`, since each copy reports the total as of its own last check;
+  - a new panel shows requests per copy.
+
+### M5. Proof with three real copies
+All tests used a model name that doesn't exist, so the rate limiter, which runs before the model lookup, counted every request without OpenAI being called.
+
+| Test | Result |
+|---|---|
+| 150 requests, team limit 60 per minute, 3 copies | **60 allowed, 90 refused.** The load balancer split them 50 / 50 / 50, so separate counters would have let all 150 through (K1). |
+| The same with Redis stopped | **60 allowed**: each copy used its share of 20 (K4). All 3 copies showed `degraded = 1`, and each logged one ERROR, not one per request. |
+| 400 requests over 13 s, `docker stop` on one copy 5 s in | **400 of 400 succeeded**, the slowest in 51 ms. nginx moved traffic to the other two copies, and the stopped copy finished its in-flight requests before exiting. |
+| A real OpenAI request and stream through nginx | Works. The stream arrived chunk by chunk (TTFT 1.44 s, total 2.05 s), so buffering is really off. |
+
+**Still to do:** Ollama's `base_url` is `localhost:11434`, which inside a container means the container itself. When Ollama is installed, it becomes `host.docker.internal:11434`.

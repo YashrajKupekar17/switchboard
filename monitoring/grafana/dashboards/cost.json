@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "gateway_budget_used_ratio",
+          "expr": "max by (team) (gateway_budget_used_ratio)",
           "legendFormat": "{{team}}",
           "refId": "A"
         }
@@ -158,7 +158,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "gateway_budget_spent_usd",
+          "expr": "max by (team) (gateway_budget_spent_usd)",
           "legendFormat": "{{team}}",
           "refId": "A"
         }

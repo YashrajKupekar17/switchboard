@@ -203,8 +203,8 @@
     },
     {
       "type": "stat",
-      "title": "Breakers open",
-      "description": "Deployments being skipped right now.",
+      "title": "Breakers open (number of gateway copies)",
+      "description": "Each gateway copy has its own breakers (G4), so a failing provider shows up as 1, 2 or 3 copies.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -227,7 +227,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "gateway_breaker_state{state=\"open\"} == 1",
+          "expr": "count by (deployment) (gateway_breaker_state{state=\"open\"} == 1)",
           "legendFormat": "{{deployment}}",
           "refId": "A"
         }
@@ -325,6 +325,38 @@
           },
           "expr": "histogram_quantile(0.95, sum by (le, deployment) (rate(gateway_tpot_seconds_bucket[5m])))",
           "legendFormat": "{{deployment}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per second, by gateway copy",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The load balancer sends requests round-robin, so the lines should be close together.",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance) (rate(gateway_requests_total[1m]))",
+          "legendFormat": "{{instance}}",
           "refId": "A"
         }
       ]

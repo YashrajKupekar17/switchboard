@@ -107,9 +107,9 @@ class PostgresLedger:
         return int(total)
 
 
-async def create_ledger(pool: asyncpg.Pool) -> PostgresLedger:
-    async with pool.acquire() as conn:
-        await conn.execute(SCHEMA)
+async def open_ledger(pool: asyncpg.Pool) -> PostgresLedger:
+    if await pool.fetchval("SELECT to_regclass('usage_ledger')") is None:  # made by scripts/setup_db.py
+        raise RuntimeError("table usage_ledger doesn't exist: run scripts/setup_db.py first")
     return PostgresLedger(pool)
 
 

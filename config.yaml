@@ -62,7 +62,8 @@ rate_limits:
   default: {rpm: 60, tpm: 100000}
   teams:                      # overrides; a team not listed here gets the default
     search: {rpm: 600, tpm: 1000000}
-  gateway_copies: 1           # while Redis is down, each copy enforces limit / gateway_copies on its own
+  gateway_copies: 3           # while Redis is down, each copy enforces limit / gateway_copies on its own
+                              # (keep in sync with `replicas` in docker-compose.yml)
 
 # USD per 1M tokens, copied from each provider's pricing page on 2026-11-09. Every deployment used
 # under `models` needs one, or the gateway won't start. cached_input and cache_write default to input.

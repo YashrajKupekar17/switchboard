@@ -95,7 +95,11 @@ class PostgresKeys:
 async def connect(dsn: str) -> PostgresKeys:
     # A small pool, opened once: a new connection per query would cost 5-20 ms; a reused one about 1 ms.
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5, command_timeout=2)
-    await pool.execute(SCHEMA)
+    # The gateway's database user can't create tables (least privilege, DECISIONS.md M3), so tables are made
+    # by scripts/setup_db.py. Check they exist now, rather than failing on the first request.
+    if await pool.fetchval("SELECT to_regclass('api_keys')") is None:
+        await pool.close()
+        raise RuntimeError("table api_keys doesn't exist: run scripts/setup_db.py first")
     return PostgresKeys(pool)
 
 

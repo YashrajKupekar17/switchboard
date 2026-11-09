@@ -22,14 +22,15 @@ The target is under 20 ms of added latency per request, at 50 requests per secon
 
 ```mermaid
 flowchart LR
-    C[Team services<br/>OpenAI SDK] --> LB[Load balancer]
+    C[Team services<br/>OpenAI SDK] --> LB[nginx]
     LB --> G1[switchboard]
     LB --> G2[switchboard]
-    G1 & G2 --> P1[OpenAI]
-    G1 & G2 --> P2[Ollama / others]
-    G1 & G2 -. rate limits, spend totals .-> R[(Redis)]
-    G1 & G2 -. keys, usage ledger .-> PG[(Postgres)]
-    G1 & G2 -. /metrics .-> PR[Prometheus] --> GF[Grafana]
+    LB --> G3[switchboard]
+    G1 & G2 & G3 --> P1[OpenAI]
+    G1 & G2 & G3 --> P2[Ollama / others]
+    G1 & G2 & G3 -. rate limits, spend totals .-> R[(Redis)]
+    G1 & G2 & G3 -. keys, usage ledger .-> PG[(Postgres)]
+    G1 & G2 & G3 -. /metrics .-> PR[Prometheus] --> GF[Grafana]
 ```
 
 The gateway copies are stateless, so you can add or remove them freely. Anything that has to be shared between them (rate-limit counters, budgets, the cache) will live in Redis.
@@ -99,16 +100,15 @@ Alerts are based on TTFT and TPOT rather than total latency. Total latency mostl
 
 ## Running it
 
-You need Python 3.9 or newer, Docker, and an OpenAI API key.
+You need Docker and an OpenAI API key. Python 3.9 or newer is only needed for the scripts and tests.
 
 ```bash
+cp .env.example .env                  # then add your OPENAI_API_KEY
+docker compose up -d --build          # 3 gateway copies behind nginx on :8000, plus Postgres, Redis,
+                                      # Prometheus :9090 and Grafana :3000
+
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-cp .env.example .env                  # then add your OPENAI_API_KEY
-
-docker compose up -d                  # Postgres :5432, Redis :6379, Prometheus :9090, Grafana :3000
-.venv/bin/uvicorn main:app            # gateway on :8000
-
 .venv/bin/python scripts/keys.py create my-team "laptop"   # prints a key once
 export SWITCHBOARD_API_KEY=sbk_...                        # the key it printed
 
@@ -117,6 +117,10 @@ export SWITCHBOARD_API_KEY=sbk_...                        # the key it printed
 ```
 
 Then open Grafana at http://localhost:3000 and go to Dashboards > Gateway: on-call.
+
+`docker compose up` first runs a one-off `db-setup` container that creates the tables and a `gateway` database user. The gateway copies log in as that user, which can read keys and add usage rows but can't create keys, edit spend, or change tables. `scripts/keys.py` runs on your machine as the database owner.
+
+To run a single gateway outside Docker while developing, keep the other services running, run `scripts/setup_db.py` once, and start `.venv/bin/uvicorn main:app --port 8001`.
 
 Tests mock every provider, the key store and Redis, so they don't need a key, Postgres, Redis, or a network connection:
 
@@ -129,7 +133,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 0: passthrough proxy
 - [x] Phase 1: streaming (SSE), TTFT, usage tracking
 - [x] Phase 2: config routing, fallback, retries, circuit breaker, metrics
-- [ ] Phase 3: per-team API keys, rate limits and budgets (done); everything runs in Docker
+- [x] Phase 3: per-team API keys, rate limits, budgets, and everything running in Docker
 - [ ] Phase 4: exact and semantic caching
 - [ ] Phase 5: cascade routing (try a cheap model first, escalate when needed)
 - [ ] Phase 6: mock provider, load tests with Locust, published numbers

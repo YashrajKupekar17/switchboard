@@ -4,12 +4,12 @@ groups:
   - name: budgets
     rules:
       - alert: BudgetAt80Percent
-        expr: gateway_budget_used_ratio >= 0.8 and gateway_budget_used_ratio < 1
+        expr: max by (team) (gateway_budget_used_ratio) >= 0.8 < 1
         labels: {severity: info}
         annotations:
           summary: "Team {{ $labels.team }} has used {{ $value | humanizePercentage }} of its soft budget"
       - alert: BudgetOverSoftLimit
-        expr: gateway_budget_used_ratio >= 1
+        expr: max by (team) (gateway_budget_used_ratio) >= 1
         labels: {severity: warning}
         annotations:
           summary: "Team {{ $labels.team }} is over its soft budget; requests stop at max_usd"

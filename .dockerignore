@@ -1,0 +1,12 @@
+# Kept out of the image: secrets, local environments, and things the gateway doesn't need to run.
+.env
+.venv
+.git
+notes
+tests
+monitoring
+deploy
+*.md
+__pycache__
+.pytest_cache
+.DS_Store

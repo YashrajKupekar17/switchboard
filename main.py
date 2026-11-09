@@ -56,7 +56,7 @@ async def open_key_store():
 
 async def open_ledger(key_store):
     # The ledger shares the key store's Postgres pool: same database, no second set of connections.
-    return await budgets.create_ledger(key_store.pool)
+    return await budgets.open_ledger(key_store.pool)
 
 
 def open_redis() -> redis.Redis:
