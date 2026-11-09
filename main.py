@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import math
 import os
@@ -14,8 +15,10 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 
+import budgets
 from breaker import Breakers
 import keys
+import pricing
 import ratelimit
 from config import load_config
 from metrics import ATTEMPTS, FALLBACKS, RATE_LIMITED, RequestMetrics
@@ -51,6 +54,11 @@ async def open_key_store():
     return await keys.connect(os.environ["DATABASE_URL"])
 
 
+async def open_ledger(key_store):
+    # The ledger shares the key store's Postgres pool: same database, no second set of connections.
+    return await budgets.create_ledger(key_store.pool)
+
+
 def open_redis() -> redis.Redis:
     # Connects lazily, so the gateway starts even if Redis is down (rate limits fail open, DECISIONS.md K4).
     # Short timeouts: Redis answers in well under a millisecond, so a slow answer means it's in trouble.
@@ -65,9 +73,13 @@ async def lifespan(app: FastAPI):
     app.state.breakers = Breakers()  # in this process's memory, by design (DECISIONS.md G4)
     app.state.key_store = await open_key_store()
     app.state.keys = keys.KeyCache(app.state.key_store)  # in-process cache in front of Postgres (J2)
-    app.state.limiter = ratelimit.RateLimiter(open_redis(), CONFIG.limits_for, CONFIG.gateway_copies)
+    shared = open_redis()  # one Redis connection pool for rate limits and budgets
+    app.state.limiter = ratelimit.RateLimiter(shared, CONFIG.limits_for, CONFIG.gateway_copies)
+    app.state.budgets = budgets.Budgets(shared, await open_ledger(app.state.key_store), CONFIG.budget_for)
+    app.state.budgets.start()  # writes buffered usage rows to Postgres every second
     yield
     await app.state.http.aclose()
+    await app.state.budgets.stop()  # before the pool closes: writes the last rows
     await app.state.key_store.close()
     await app.state.limiter.close()
 
@@ -137,9 +149,16 @@ async def chat_completions(
         RATE_LIMITED.labels(caller.team, decision.exceeded).inc()
         return _rate_limited(caller.team, limits, decision, estimate)
 
-    def settle(usage):
+    # Then the monthly budget (DECISIONS.md L).
+    budget = CONFIG.budget_for(caller.team)
+    spend = await app.state.budgets.check(caller.team)
+    if not spend.allowed:
+        RATE_LIMITED.labels(caller.team, "budget").inc()
+        return _over_budget(caller.team, budget, spend)
+
+    def settle(target, usage):
         # Called with the provider's real usage once the answer is done (for a stream, after the last chunk).
-        task = asyncio.create_task(app.state.limiter.settle(caller.team, estimate, usage))
+        task = asyncio.create_task(_settle(caller, request.model, target, estimate, usage))
         _settling.add(task)
         task.add_done_callback(_settling.discard)
 
@@ -175,7 +194,9 @@ async def chat_completions(
 
             result = None
             try:
-                result = await call_target(app.state.http, target, payload, request.stream, on_usage=settle)
+                result = await call_target(
+                    app.state.http, target, payload, request.stream, on_usage=lambda u, t=target: settle(t, u)
+                )
             finally:
                 if result is None:  # cancelled or crashed before the provider gave a verdict
                     breaker.release(permit)
@@ -189,6 +210,7 @@ async def chat_completions(
                 if failures:
                     result.headers["x-gateway-attempts"] = _attempts(failures)
                 result.headers.update(_limit_headers(limits, decision))
+                result.headers.update(_budget_headers(budget, spend))
                 return result
 
             ATTEMPTS.labels(target.deployment, result.kind).inc()
@@ -208,6 +230,46 @@ async def chat_completions(
             break
 
     return _all_failed(request.model, failures)
+
+
+async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage: Optional[dict]) -> None:
+    await app.state.limiter.settle(caller.team, estimate, usage)
+    estimated = not usage
+    if estimated:  # stream cut short before the usage report: charge the prompt estimate, and say so
+        usage = {"prompt_tokens": estimate, "completion_tokens": 0}
+    await app.state.budgets.record(
+        team=caller.team, key_id=caller.id, model=model, deployment=target.deployment,
+        tokens=pricing.split_usage(usage), cost_micros=pricing.cost_micros(CONFIG.prices[target.deployment], usage),
+        estimated=estimated,
+    )
+
+
+def _budget_headers(budget: budgets.Budget, spend: budgets.Spend) -> dict:
+    if spend.spent_micros is None:  # Redis down: we don't know, so we don't pretend to
+        return {}
+    return {
+        "x-gateway-budget-spent-usd": pricing.micros_to_usd(spend.spent_micros),
+        "x-gateway-budget-soft-usd": pricing.usd(budget.soft_usd)[1:],
+        "x-gateway-budget-max-usd": pricing.usd(budget.max_usd)[1:],
+    }
+
+
+def _over_budget(team: str, budget: budgets.Budget, spend: budgets.Spend) -> JSONResponse:
+    now = budgets.utcnow()
+    next_month = (budgets.month_start(now) + datetime.timedelta(days=32)).replace(day=1)
+    headers = _budget_headers(budget, spend)
+    headers["Retry-After"] = str(int((next_month - now).total_seconds()))
+    return JSONResponse(
+        status_code=429,
+        # OpenAI uses insufficient_quota for "you're out of credit", which is what this is.
+        content={"error": {
+            "message": f"team {team!r} has reached its monthly budget of {pricing.usd(budget.max_usd)}; "
+                       f"it resets on {next_month:%Y-%m-%d} (UTC)",
+            "type": "insufficient_quota",
+            "code": "budget_exceeded",
+        }},
+        headers=headers,
+    )
 
 
 def _limit_headers(limits: ratelimit.Limits, decision: ratelimit.Decision) -> dict:

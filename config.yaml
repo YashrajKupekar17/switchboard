@@ -63,3 +63,23 @@ rate_limits:
   teams:                      # overrides; a team not listed here gets the default
     search: {rpm: 600, tpm: 1000000}
   gateway_copies: 1           # while Redis is down, each copy enforces limit / gateway_copies on its own
+
+# USD per 1M tokens, copied from each provider's pricing page on 2026-11-09. Every deployment used
+# under `models` needs one, or the gateway won't start. cached_input and cache_write default to input.
+prices:
+  openai/gpt-4o-mini:     {input: 0.15,  cached_input: 0.075,  output: 0.60}
+  openai/gpt-4o:          {input: 2.50,  cached_input: 1.25,   output: 10.00}
+  groq/openai/gpt-oss-20b:  {input: 0.075, cached_input: 0.0375, output: 0.30}
+  groq/openai/gpt-oss-120b: {input: 0.15,  cached_input: 0.075,  output: 0.60}
+  ollama/llama3.2:        {input: 0, output: 0}   # runs on our own machine: no per-token bill (the GPU isn't free)
+  # Anthropic: 5-minute cache writes cost 1.25x input. Haiku 5.5 costs 5x more for prompts over
+  # 100k tokens ($0.50 / $2.50), which this table doesn't model yet.
+  anthropic/claude-haiku-5-5:  {input: 0.10, cached_input: 0.01, cache_write: 0.125, output: 0.50}
+  anthropic/claude-sonnet-5-5: {input: 2.00, cached_input: 0.10, cache_write: 2.50,  output: 10.00}
+
+# Monthly budgets per team, reset on the 1st at 00:00 UTC (DECISIONS.md L).
+# Past soft_usd: a warning and an alert, requests still work. At max_usd: requests get 429 budget_exceeded.
+budgets:
+  default: {soft_usd: 50, max_usd: 60}
+  teams:
+    search: {soft_usd: 500, max_usd: 600}

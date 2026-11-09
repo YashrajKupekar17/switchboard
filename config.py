@@ -4,6 +4,8 @@ from typing import Optional
 
 import yaml
 
+from budgets import Budget
+from pricing import Price
 from ratelimit import Limits
 
 PROVIDER_TYPES = ("openai", "anthropic")  # "openai" = anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM...)
@@ -47,9 +49,15 @@ class Config:
     default_limits: Limits
     team_limits: dict[str, Limits]
     gateway_copies: int  # used only to split limits while Redis is down
+    prices: dict[str, Price]  # deployment ("openai/gpt-4o-mini") -> price
+    default_budget: Budget
+    team_budgets: dict[str, Budget]
 
     def limits_for(self, team: str) -> Limits:
         return self.team_limits.get(team, self.default_limits)
+
+    def budget_for(self, team: str) -> Budget:
+        return self.team_budgets.get(team, self.default_budget)
 
 
 def load_config(path: str) -> Config:
@@ -76,6 +84,20 @@ def load_config(path: str) -> Config:
                 raise RuntimeError(f"model {alias!r}: unknown provider {t['provider']!r}")
         models[alias] = [Target(provider=providers[t["provider"]], model=t["model"]) for t in targets]
 
+    prices = {deployment: Price.from_config(p) for deployment, p in (raw.get("prices") or {}).items()}
+    for targets in models.values():
+        for t in targets:
+            if t.deployment not in prices:
+                # Without a price its spend would silently count as $0 and no budget could stop it.
+                raise RuntimeError(f"no price for {t.deployment!r}: add it under `prices` in the config")
+
+    b = raw.get("budgets", {})
+    default_budget = b.get("default", {"soft_usd": 50, "max_usd": 60})
+    budgets = {team: Budget(**{**default_budget, **v}) for team, v in (b.get("teams") or {}).items()}
+    for team, budget in [("default", Budget(**default_budget)), *budgets.items()]:
+        if budget.max_usd < budget.soft_usd:
+            raise RuntimeError(f"budget for {team!r}: max_usd must be at least soft_usd")
+
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})
     return Config(
@@ -84,4 +106,7 @@ def load_config(path: str) -> Config:
         default_limits=Limits(**default),
         team_limits={team: Limits(**{**default, **l}) for team, l in (rl.get("teams") or {}).items()},
         gateway_copies=rl.get("gateway_copies", 1),
+        prices=prices,
+        default_budget=Budget(**default_budget),
+        team_budgets=budgets,
     )

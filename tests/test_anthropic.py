@@ -104,7 +104,10 @@ def test_translates_request_and_response(client):
     assert body["object"] == "chat.completion"
     assert body["choices"][0]["message"] == {"role": "assistant", "content": "Hello there"}  # thinking left out
     assert body["choices"][0]["finish_reason"] == "stop"
-    assert body["usage"] == {"prompt_tokens": 15, "completion_tokens": 4, "total_tokens": 19}  # cache reads count
+    assert body["usage"] == {  # cache reads count as prompt tokens, and stay visible for pricing
+        "prompt_tokens": 15, "completion_tokens": 4, "total_tokens": 19,
+        "prompt_tokens_details": {"cached_tokens": 5, "cache_creation_tokens": 0},
+    }
     assert resp.headers["x-gateway-dropped-params"] == "temperature"
     assert tokens.change == 15
 

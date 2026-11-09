@@ -463,3 +463,49 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Tests** use `fakeredis`, which runs the real Lua script, plus a test that runs the same steps through the Lua and the Python fallback and checks that they agree.
 - **Checked against real Redis:** with a 3 per minute limit, requests 1–3 got 200 and request 4 got 429 with `Retry-After: 15`. After stopping Redis, requests went on working with local limits, the degraded gauge went to 1, and one ERROR was logged. After restarting Redis, the gateway went back to the shared bucket, and the bucket still remembered the usage from before the outage (the named volume kept it).
 - **Production terms:** *Lua script*, *atomicity*, *clock skew*, *lazy connection*, *key expiry (TTL)*.
+
+## L. Budgets (Phase 3c)
+
+### L1. A warning amount and a hard stop, as two dollar numbers
+- **Decision:** each team has `soft_usd` and `max_usd` per month, in `config.yaml`. Past `soft_usd`: one WARNING log line per month, Prometheus alerts, and requests still work. At `max_usd`: `429` with `code: budget_exceeded` and `type: insufficient_quota` (OpenAI's word for "out of credit"), until the month resets on the 1st at 00:00 UTC.
+- **Why both:** a hard stop alone breaks a production service on the 28th. Warnings alone never stop a runaway loop at 2 a.m. The soft amount gives days of notice, and the hard stop caps the damage.
+- **Why two numbers, not "budget plus 20%":** "warn at $500, stop at $600" is easier to read than a percentage, and it's how LiteLLM does it (`soft_budget`, `max_budget`).
+- **Industry:** LiteLLM (`soft_budget` alerts, `max_budget` rejects, `budget_duration` resets), Portkey (alert threshold by email, then the key stops), OpenRouter (per-key credit limits that reset daily, weekly or monthly at midnight UTC), AWS Budgets (alerts at chosen percentages, actions optional). They all warn first and stop later, and they all reset on a UTC schedule.
+- **Production terms:** *soft limit vs hard limit*, *chargeback / showback*, *budget period*.
+
+### L2. What a request costs
+- **Prices** live in `config.yaml` as USD per million tokens, the unit providers publish, copied from each provider's pricing page. A configured model without a price stops startup, the same rule as missing API keys. Otherwise its spend would count as $0 and no budget could stop it. (Portkey documents exactly this gap: models without pricing don't count towards budgets.)
+- **The formula:** uncached input × input price + cached input × cached price + cache writes × cache-write price + output × output price.
+  - Output includes hidden reasoning tokens. Providers bill them, and gpt-oss spent 98 of 111 tokens on them in I8.
+  - The model that actually answered sets the price, not the one the client asked for. A fallback to Groq is billed at Groq's price.
+- **Money is an integer number of micro-dollars** (1 = $0.000001), never a float. Floats can't hold amounts like $0.0004 exactly, and sums of millions of them drift. "$X per 1M tokens" is exactly "X micro-dollars per token", so the maths is tokens × price, in `Decimal`, rounded once per request. Rounding is at most half a micro-dollar per request, which comes to $0.50 per million requests.
+- **The Anthropic adapter now keeps the cache split:** cache reads go in `prompt_tokens_details.cached_tokens` (OpenAI's field), and cache writes in `prompt_tokens_details.cache_creation_tokens`, our own field, since OpenAI has none. Before this, both were added into `prompt_tokens`, which lost the information pricing needs.
+- **Known gaps:** Haiku 5.5's higher price for prompts over 100k tokens isn't modelled. Ollama is $0, though its GPU isn't free. We track list prices; committed-use discounts get reconciled against the real invoice by finance.
+- **Production terms:** *list price*, *fixed-point money*, *price snapshot*.
+
+### L3. Postgres ledger as the source of truth, Redis as a cache of the total
+- **Decision:** one row per request in an append-only `usage_ledger` table: team, key, requested model, deployment that answered, the four token counts, cost in micro-dollars, and whether the cost was estimated. Rows are added, never changed. Each gateway copy buffers rows in memory and writes them with one `COPY` every second.
+- **Redis holds each team's total for the month** (`spend:{team}:{YYYY-MM}`), so the check before each request is one `GET`, not a `SUM` over millions of rows.
+- **The total is only a cache.** It expires after 5 minutes and is rebuilt with one `SUM` over the ledger (indexed on `team, created_at`). Anything Redis missed, such as an outage or a restart, is corrected within 5 minutes. New spend is added with `INCRBY` only when the total exists (a small Lua script). Otherwise the next check rebuilds it, because creating a fresh total from one request would forget the rest of the month.
+- **Why not Redis as the main record, synced to Postgres later:** whatever hasn't synced is lost when Redis dies, and for money that's not acceptable. *Write to the durable store, derive the fast view.*
+- **Why not one INSERT per request:** that would actually work at 300 RPS, but batching makes it one round trip per second instead of 300.
+- **Why the price is stored on each row:** prices change, and last month's bill must never be recalculated with today's prices.
+- **Known, bounded errors:**
+  - a gateway copy that crashes loses up to about 1 s of its unwritten rows (a clean shutdown writes them);
+  - a rebuilt total misses the rows still in the buffer, about 1 s of traffic, until the next rebuild;
+  - a request that starts just under `max_usd` can end above it, by at most one request's cost per request in flight.
+- **Production terms:** *append-only ledger*, *event sourcing (lite)*, *derived view*, *write batching*, *cache rebuild*, *source of truth*.
+
+### L4. When things fail
+- **Redis down:** the check is skipped (fail open, the same reasoning as K4), and the response has no budget headers instead of made-up numbers. Rows still go to Postgres, so nothing is lost, and the next rebuild catches up.
+- **Postgres down:** rows stay in the buffer and are retried every second. The buffer is capped at 100,000 rows, about 5 minutes at 300 RPS; past that the oldest rows are dropped and counted in `gateway_ledger_dropped_rows_total`. Prometheus alerts when more than 1,000 rows are waiting for a minute.
+- **A stream cut short before its usage report:** the prompt estimate is charged as input, and the row is marked `estimated = true`.
+
+### L5. Where it runs and what people see
+- **Order:** `auth → rate limit → budget → router → provider`. A refused request is counted in `gateway_rate_limited_total{limit="budget"}`.
+- **Headers on every response:** `x-gateway-budget-spent-usd`, `-soft-usd` and `-max-usd`. A team's own code can watch them, the same idea as OpenRouter's `limit_remaining`.
+- **Metrics:** `gateway_budget_spent_usd{team}`, `gateway_budget_used_ratio{team}` (spend / soft budget), `gateway_ledger_buffered_rows`, and `gateway_ledger_dropped_rows_total`. The cost dashboard shows budget used and spend per team. `team` is a safe label: there are tens of teams, not millions.
+- **Alerts** (`monitoring/alerts.yml`): 80% of the soft budget, over the soft budget, and ledger writes failing. In production, Alertmanager would send them to Slack; here they show in Prometheus's Alerts page.
+- **Tests** (13 budget tests, 7 pricing tests) use fakeredis and a fake ledger.
+- **Checked for real:** Postgres, Redis and OpenAI, with a $0.00001 soft budget and a $0.00003 max. Each "Say hi" cost 4 micro-dollars (9 input + 5 output tokens on gpt-4o-mini). The spend header climbed 0 → 4 → 8 … → 28 µ$, the warning was logged once at 12 µ$, and request 9 got 429 at 32 µ$, overshooting by one request as expected.
+- **Bug the real test found:** Postgres's `SUM()` of a `BIGINT` returns a `NUMERIC`, which asyncpg turns into a `Decimal`, and Redis refused to store it. The fake ledger returned an `int`, so the tests couldn't see this. Fail open did its job: all 10 requests still landed in the ledger. The fix is to convert to `int`. **Lesson:** a fake can hide the real driver's types. That's why each phase also gets a real run.

@@ -64,9 +64,15 @@ def to_anthropic(payload: dict) -> Tuple[dict, List[str]]:
 
 def _usage(u: dict) -> dict:
     # OpenAI's prompt_tokens includes cached tokens; Anthropic reports cache reads and writes separately.
-    prompt = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+    # Keep the split in OpenAI's prompt_tokens_details: reads and writes are priced differently (pricing.py).
+    # OpenAI has no field for cache writes, so cache_creation_tokens is ours; clients ignore unknown fields.
+    read, write = u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0)
+    prompt = u.get("input_tokens", 0) + read + write
     completion = u.get("output_tokens", 0)
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    if read or write:
+        usage["prompt_tokens_details"] = {"cached_tokens": read, "cache_creation_tokens": write}
+    return usage
 
 
 def from_anthropic(body: dict) -> dict:

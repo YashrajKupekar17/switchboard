@@ -5,6 +5,7 @@ services:
     image: prom/prometheus:v3.5.0
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus  # the history lives here, outside the container, so it survives `down`
     ports: ["9090:9090"]
     extra_hosts: ["host.docker.internal:host-gateway"]  # lets the container reach the gateway on the host (Linux too)

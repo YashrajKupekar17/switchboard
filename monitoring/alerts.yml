@@ -1,0 +1,21 @@
+# Alert rules, evaluated by Prometheus. Firing alerts show at http://localhost:9090/alerts.
+# In production, Alertmanager would route them to Slack or email; that's config, not gateway code.
+groups:
+  - name: budgets
+    rules:
+      - alert: BudgetAt80Percent
+        expr: gateway_budget_used_ratio >= 0.8 and gateway_budget_used_ratio < 1
+        labels: {severity: info}
+        annotations:
+          summary: "Team {{ $labels.team }} has used {{ $value | humanizePercentage }} of its soft budget"
+      - alert: BudgetOverSoftLimit
+        expr: gateway_budget_used_ratio >= 1
+        labels: {severity: warning}
+        annotations:
+          summary: "Team {{ $labels.team }} is over its soft budget; requests stop at max_usd"
+      - alert: LedgerWritesFailing
+        expr: gateway_ledger_buffered_rows > 1000
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Usage rows are piling up in the gateway: Postgres writes are failing"

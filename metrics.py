@@ -40,6 +40,12 @@ TPOT = Histogram(
 RATE_LIMITED = Counter("gateway_rate_limited_total", "Requests refused with 429, by team and limit", ["team", "limit"])
 RATE_LIMIT_DEGRADED = Gauge("gateway_rate_limit_degraded", "1 while Redis is unreachable and limits are per copy")
 
+# --- budgets (DECISIONS.md L) ---
+BUDGET_SPENT = Gauge("gateway_budget_spent_usd", "Spend this month, as of the team's last request", ["team"])
+BUDGET_USED = Gauge("gateway_budget_used_ratio", "Spend this month / soft budget (1.0 = at the soft budget)", ["team"])
+LEDGER_BUFFERED = Gauge("gateway_ledger_buffered_rows", "Usage rows waiting to be written to Postgres")
+LEDGER_DROPPED = Counter("gateway_ledger_dropped_rows_total", "Usage rows lost because the buffer was full")
+
 # --- cost / usage ---
 TOKENS = Counter("gateway_tokens_total", "Tokens used, from the provider's usage report", ["deployment", "kind"])
 

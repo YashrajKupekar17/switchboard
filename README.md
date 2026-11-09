@@ -27,8 +27,8 @@ flowchart LR
     LB --> G2[switchboard]
     G1 & G2 --> P1[OpenAI]
     G1 & G2 --> P2[Ollama / others]
-    G1 & G2 -. rate limits .-> R[(Redis)]
-    G1 & G2 -. keys .-> PG[(Postgres)]
+    G1 & G2 -. rate limits, spend totals .-> R[(Redis)]
+    G1 & G2 -. keys, usage ledger .-> PG[(Postgres)]
     G1 & G2 -. /metrics .-> PR[Prometheus] --> GF[Grafana]
 ```
 
@@ -37,7 +37,7 @@ The gateway copies are stateless, so you can add or remove them freely. Anything
 Each request goes through these steps, in this order:
 
 ```
-auth -> rate limit -> cache -> router -> provider (with fallback + circuit breaker)
+auth -> rate limit -> budget -> cache -> router -> provider (with fallback + circuit breaker)
 ```
 
 Rate limiting runs before the cache on purpose: otherwise one team spamming cached prompts could hog the gateway at everyone else's expense.
@@ -72,6 +72,8 @@ Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven
 
 **Rate limits per team.** Each team has two token buckets in Redis, shared by every gateway copy: requests per minute and tokens per minute. Before calling a provider, the gateway takes a rough guess of the prompt's tokens; when the answer is done, it charges the real number from the provider's usage report. A team over its limit gets a 429 shaped like OpenAI's, with `Retry-After`, so the OpenAI SDK waits and retries on its own. If Redis goes down, requests keep flowing: each gateway copy enforces its share of the limit by itself until Redis is back.
 
+**Monthly budgets per team.** Every request is priced by the model that actually answered: input, cached input, cache writes and output each at their own price, from a table in `config.yaml`. Money is kept as whole micro-dollars, never floats. Each request is written to an append-only ledger in Postgres, and Redis keeps a running total per team so the check before each request is a single lookup. A team past its `soft_usd` gets a warning and an alert; at `max_usd` its requests get a 429 until the month resets. If Redis is down, the check is skipped, but spending is still recorded.
+
 **Fallback and retries.** The rule is to fall back only when the problem is the provider's, never the client's:
 
 | What happened | What switchboard does |
@@ -91,7 +93,7 @@ Clients can opt out of fallback with the `x-gateway-fallback: off` header.
 **Metrics.** A Prometheus endpoint at `/metrics`, plus two Grafana dashboards:
 
 - **On-call:** request rate, error rate, and p50/p95 latency; then fallbacks, attempts per provider, open breakers, in-flight requests, time to first token (TTFT), and time per output token (TPOT).
-- **Cost and usage:** tokens per model.
+- **Cost and usage:** tokens per model, plus spend and budget used per team. Prometheus alerts at 80% and 100% of a team's soft budget.
 
 Alerts are based on TTFT and TPOT rather than total latency. Total latency mostly reflects how long the answer was, so a jump might just mean someone asked for longer answers. TTFT and TPOT only go up when the provider itself gets slower.
 
@@ -127,7 +129,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 0: passthrough proxy
 - [x] Phase 1: streaming (SSE), TTFT, usage tracking
 - [x] Phase 2: config routing, fallback, retries, circuit breaker, metrics
-- [ ] Phase 3: per-team API keys (done), rate limits in Redis (done), budgets; everything runs in Docker
+- [ ] Phase 3: per-team API keys, rate limits and budgets (done); everything runs in Docker
 - [ ] Phase 4: exact and semantic caching
 - [ ] Phase 5: cascade routing (try a cheap model first, escalate when needed)
 - [ ] Phase 6: mock provider, load tests with Locust, published numbers

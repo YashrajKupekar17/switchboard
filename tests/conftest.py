@@ -36,6 +36,33 @@ class FakeKeyStore:
         pass
 
 
+class FakeLedger:
+    """Stands in for the Postgres usage ledger: rows in a list."""
+
+    def __init__(self):
+        self.rows = []
+        self.down = False
+
+    async def insert(self, rows):
+        if self.down:
+            raise OSError("connection refused")
+        self.rows.extend(rows)
+
+    async def month_total(self, team, since):
+        return sum(r[9] for r in self.rows if r[1] == team and r[0] >= since)  # r[9] = cost_micros
+
+
+@pytest.fixture
+def ledger(monkeypatch):
+    fake = FakeLedger()
+
+    async def open_fake(key_store):
+        return fake
+
+    monkeypatch.setattr(main, "open_ledger", open_fake)
+    return fake
+
+
 @pytest.fixture
 def key_store(monkeypatch):
     store = FakeKeyStore({TEST_KEY: keys.KeyInfo(1, "test-team", TEST_KEY[:keys.VISIBLE_CHARS])})
@@ -56,7 +83,7 @@ def fake_redis(monkeypatch):
 
 
 @pytest.fixture
-def client(key_store, fake_redis):
+def client(key_store, fake_redis, ledger):
     # `with` runs lifespan, so the shared httpx client and the key cache exist. Every request is authenticated.
     with TestClient(main.app, headers=AUTH) as c:
         yield c
