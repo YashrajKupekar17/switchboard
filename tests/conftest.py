@@ -7,6 +7,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")  # fake: tests never reach Anthropic
 os.environ["GATEWAY_CONFIG"] = str(Path(__file__).parent / "config.test.yaml")
 
+import fakeredis  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -47,7 +48,15 @@ def key_store(monkeypatch):
 
 
 @pytest.fixture
-def client(key_store):
+def fake_redis(monkeypatch):
+    # An in-memory Redis that runs Lua, so the real rate limit script runs in tests.
+    server = fakeredis.FakeServer()
+    monkeypatch.setattr(main, "open_redis", lambda: fakeredis.FakeAsyncRedis(server=server))
+    return server
+
+
+@pytest.fixture
+def client(key_store, fake_redis):
     # `with` runs lifespan, so the shared httpx client and the key cache exist. Every request is authenticated.
     with TestClient(main.app, headers=AUTH) as c:
         yield c

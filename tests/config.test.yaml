@@ -36,3 +36,7 @@ models:
       model: gpt-4o-mini
     - provider: anthropic
       model: claude-haiku-5-5
+
+rate_limits:
+  default: {rpm: 1000, tpm: 1000000}  # high enough that only the rate limit tests ever hit it
+  gateway_copies: 2

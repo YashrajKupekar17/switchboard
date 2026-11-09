@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import math
 import os
 import random
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
+import redis.asyncio as redis
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response
@@ -14,8 +16,9 @@ from pydantic import BaseModel, ConfigDict
 
 from breaker import Breakers
 import keys
+import ratelimit
 from config import load_config
-from metrics import ATTEMPTS, FALLBACKS, RequestMetrics
+from metrics import ATTEMPTS, FALLBACKS, RATE_LIMITED, RequestMetrics
 from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
@@ -48,6 +51,13 @@ async def open_key_store():
     return await keys.connect(os.environ["DATABASE_URL"])
 
 
+def open_redis() -> redis.Redis:
+    # Connects lazily, so the gateway starts even if Redis is down (rate limits fail open, DECISIONS.md K4).
+    # Short timeouts: Redis answers in well under a millisecond, so a slow answer means it's in trouble.
+    url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    return redis.from_url(url, socket_timeout=0.1, socket_connect_timeout=0.1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # One shared client for the whole app = one connection pool, reused by every request.
@@ -55,9 +65,14 @@ async def lifespan(app: FastAPI):
     app.state.breakers = Breakers()  # in this process's memory, by design (DECISIONS.md G4)
     app.state.key_store = await open_key_store()
     app.state.keys = keys.KeyCache(app.state.key_store)  # in-process cache in front of Postgres (J2)
+    app.state.limiter = ratelimit.RateLimiter(open_redis(), CONFIG.limits_for, CONFIG.gateway_copies)
     yield
     await app.state.http.aclose()
     await app.state.key_store.close()
+    await app.state.limiter.close()
+
+
+_settling = set()  # keeps a reference to each settle task until it finishes, so it isn't garbage collected
 
 
 app = FastAPI(lifespan=lifespan)
@@ -112,6 +127,22 @@ async def chat_completions(
     caller: keys.KeyInfo = Depends(require_key),
     x_gateway_fallback: Optional[str] = Header(default=None),
 ):
+    payload = request.model_dump(exclude_none=True)
+
+    # Rate limit right after auth, before anything that costs money or time (DECISIONS.md K).
+    limits = CONFIG.limits_for(caller.team)
+    estimate = ratelimit.estimate_tokens(payload["messages"])
+    decision = await app.state.limiter.check(caller.team, estimate)
+    if not decision.allowed:
+        RATE_LIMITED.labels(caller.team, decision.exceeded).inc()
+        return _rate_limited(caller.team, limits, decision, estimate)
+
+    def settle(usage):
+        # Called with the provider's real usage once the answer is done (for a stream, after the last chunk).
+        task = asyncio.create_task(app.state.limiter.settle(caller.team, estimate, usage))
+        _settling.add(task)
+        task.add_done_callback(_settling.discard)
+
     targets = CONFIG.models.get(request.model)
     # Only configured names become a label: clients can send any string, and each one would be a new time series.
     http_request.state.metrics_model = request.model if targets else "unknown"
@@ -127,7 +158,6 @@ async def chat_completions(
     if x_gateway_fallback == "off":  # opt-out: the client wants exactly the first target or an error
         targets = targets[:1]
 
-    payload = request.model_dump(exclude_none=True)
     if request.stream:
         # Providers only send token usage at the end of a stream if asked to; we need it for cost tracking.
         payload["stream_options"] = {**payload.get("stream_options", {}), "include_usage": True}
@@ -145,7 +175,7 @@ async def chat_completions(
 
             result = None
             try:
-                result = await call_target(app.state.http, target, payload, request.stream)
+                result = await call_target(app.state.http, target, payload, request.stream, on_usage=settle)
             finally:
                 if result is None:  # cancelled or crashed before the provider gave a verdict
                     breaker.release(permit)
@@ -158,6 +188,7 @@ async def chat_completions(
                 log.info("route team=%s model=%s -> %s/%s", caller.team, request.model, target.provider.name, target.model)
                 if failures:
                     result.headers["x-gateway-attempts"] = _attempts(failures)
+                result.headers.update(_limit_headers(limits, decision))
                 return result
 
             ATTEMPTS.labels(target.deployment, result.kind).inc()
@@ -177,6 +208,33 @@ async def chat_completions(
             break
 
     return _all_failed(request.model, failures)
+
+
+def _limit_headers(limits: ratelimit.Limits, decision: ratelimit.Decision) -> dict:
+    # The same headers OpenAI sends, so clients that already read them work unchanged.
+    return {
+        "x-ratelimit-limit-requests": str(limits.rpm),
+        "x-ratelimit-remaining-requests": str(decision.remaining_requests),
+        "x-ratelimit-limit-tokens": str(limits.tpm),
+        "x-ratelimit-remaining-tokens": str(decision.remaining_tokens),
+    }
+
+
+def _rate_limited(team: str, limits: ratelimit.Limits, decision: ratelimit.Decision, estimate: int) -> JSONResponse:
+    if decision.exceeded == "tokens" and estimate > limits.tpm:
+        # It would never fit, however long the client waits. OpenAI also answers this with a 429.
+        message = f"request too large for team {team!r}: about {estimate} tokens, limit {limits.tpm} per minute"
+    else:
+        per_minute = limits.rpm if decision.exceeded == "requests" else limits.tpm
+        message = (f"rate limit reached for team {team!r} on {decision.exceeded} per minute: "
+                   f"limit {per_minute}, try again in {decision.retry_after:.1f}s")
+    headers = _limit_headers(limits, decision)
+    headers["Retry-After"] = str(max(1, math.ceil(decision.retry_after)))  # the OpenAI SDK waits this long, then retries
+    return JSONResponse(
+        status_code=429,
+        content={"error": {"message": message, "type": decision.exceeded, "code": "rate_limit_exceeded"}},
+        headers=headers,
+    )
 
 
 def _attempts(failures: list) -> str:

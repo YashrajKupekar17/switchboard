@@ -4,6 +4,8 @@ from typing import Optional
 
 import yaml
 
+from ratelimit import Limits
+
 PROVIDER_TYPES = ("openai", "anthropic")  # "openai" = anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM...)
 ANTHROPIC_VERSION = "2026-10-21"
 
@@ -42,6 +44,12 @@ class Target:
 class Config:
     providers: dict[str, Provider]
     models: dict[str, list[Target]]  # client-facing model name -> ordered targets
+    default_limits: Limits
+    team_limits: dict[str, Limits]
+    gateway_copies: int  # used only to split limits while Redis is down
+
+    def limits_for(self, team: str) -> Limits:
+        return self.team_limits.get(team, self.default_limits)
 
 
 def load_config(path: str) -> Config:
@@ -68,4 +76,12 @@ def load_config(path: str) -> Config:
                 raise RuntimeError(f"model {alias!r}: unknown provider {t['provider']!r}")
         models[alias] = [Target(provider=providers[t["provider"]], model=t["model"]) for t in targets]
 
-    return Config(providers=providers, models=models)
+    rl = raw.get("rate_limits", {})
+    default = rl.get("default", {"rpm": 60, "tpm": 100_000})
+    return Config(
+        providers=providers,
+        models=models,
+        default_limits=Limits(**default),
+        team_limits={team: Limits(**{**default, **l}) for team, l in (rl.get("teams") or {}).items()},
+        gateway_copies=rl.get("gateway_copies", 1),
+    )

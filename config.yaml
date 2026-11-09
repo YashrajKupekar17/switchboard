@@ -55,3 +55,11 @@ models:
     #   model: claude-sonnet-5-5
     - provider: groq
       model: openai/gpt-oss-120b
+
+# Per-team limits (DECISIONS.md K). Each team has two buckets: requests per minute and tokens per minute.
+# A bucket holds one minute's worth, so a team can burst up to its limit, then gets a steady rate.
+rate_limits:
+  default: {rpm: 60, tpm: 100000}
+  teams:                      # overrides; a team not listed here gets the default
+    search: {rpm: 600, tpm: 1000000}
+  gateway_copies: 1           # while Redis is down, each copy enforces limit / gateway_copies on its own

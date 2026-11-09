@@ -410,3 +410,56 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Lesson:** check model IDs against the provider's live `/models` list, not memory. **v2:** check every configured model ID at startup.
 - **Reasoning models count reasoning in `max_tokens`:** for "Say hi", Groq's gpt-oss-20b used 98 of 111 output tokens on reasoning. A small `max_tokens` can return an empty answer. The same applies to Claude's thinking (I2).
 - **Free-tier latency is mostly queueing:** Groq reported 0.7–1.1 s of `queue_time` and about 0.1 s of generation.
+
+## K. Rate limits (Phase 3b)
+
+### K1. Counters live in Redis, not in each gateway copy
+- **Problem:** with 3 gateway copies each counting in its own memory, a "100 per minute" limit really allows about 300. The real number changes whenever we add or remove copies, and an uneven load balancer can reject a team on one copy while the others sit idle.
+- **Decision:** one shared counter per team in **Redis**. A call takes well under a millisecond on a local network, and Redis runs each command (or Lua script) by itself, so two gateway copies can't both read "99" and both let a request through.
+- **Production terms:** *distributed rate limiting*, *shared state*, *atomic operation*, *race condition*.
+
+### K2. Algorithm: token bucket
+- **How it works:** each team has a bucket with a **capacity** (the biggest burst allowed) that refills at a steady **rate** (the long-term limit). A request takes coins from the bucket; an empty bucket means `429`. The bucket never fills past its capacity, so an idle team can't save up a huge allowance.
+- **No timer:** Redis stores two numbers per team, `tokens` and `last_updated`. The refill is worked out when a request arrives: `tokens = min(capacity, tokens + elapsed × rate)`. The read, refill, and subtract run as one **Lua script**, so it's atomic and one round trip.
+- **Alternatives:**
+  - *Fixed window* (a counter that resets every minute): simplest, but 100 requests at 14:05:59 plus 100 at 14:06:00 gives 200 in 2 seconds (*boundary burst*).
+  - *Sliding window log* (a sorted set of every request's timestamp): exact, but memory and work grow with traffic.
+  - *Sliding window counter* (this window's count plus a weighted share of the last one's): close to exact with two counters. Cloudflare uses it. A fine choice, but it has one dial instead of two.
+- **Why the bucket:** burst size and steady rate are separate dials; it stores two numbers per team however busy the team is; and a request can take **many coins at once**, which is what limiting LLM tokens needs (K3). OpenAI's and Anthropic's limits behave like this (they refill continuously rather than resetting on the minute), so teams already understand our 429s.
+- **Industry:** Stripe (token bucket in Redis), AWS API Gateway (token bucket), Cloudflare (sliding window counter).
+- **Production terms:** *token bucket*, *leaky bucket*, *burst capacity*, *refill rate*, *lazy refill*, *Lua scripting in Redis*.
+
+### K3. Limit both requests per minute and tokens per minute
+- **Decision:** two buckets per team, **RPM** (each request costs 1) and **TPM** (each request costs its tokens). A request has to pass both.
+- **Why both:** they catch different abuse. RPM alone lets one team send a few 100k-token prompts and use up our provider quota. TPM alone lets a team send thousands of tiny requests that load the gateway and hit the provider's own RPM limit. Providers limit both, so we have to as well.
+- **The catch with tokens:** when a request arrives we know the prompt, but not how long the answer will be.
+- **Options:**
+  - *Reserve up front* (prompt + `max_tokens`): this is what OpenAI does. But many clients don't set `max_tokens`, and reasoning models make it large, so teams get throttled for tokens they never used.
+  - *Charge afterwards* (check the bucket isn't empty, subtract the real usage when the response ends): exact, but a 200k-token prompt is only noticed after we've paid for it.
+  - *Estimate, then settle:* take an estimate of the prompt (about 4 characters per token, no tokenizer needed) before calling the provider, then charge or refund the difference once the provider reports real usage. The bucket can go below zero, and a team in debt waits until it refills.
+- **Decision: estimate, then settle.** It costs the same two Redis calls as charging afterwards, rejects a huge prompt before it costs anything, and ends up exact. Many requests in flight at once can still each pass while the bucket is positive. The RPM bucket bounds that.
+- **Production terms:** *RPM / TPM*, *reservation and reconciliation*, *estimate-then-settle*, *token debt*.
+
+### K4. Redis down: fail open, onto a smaller limit in each copy
+- **Decision:** if Redis can't be reached, each gateway copy switches to a bucket in its own memory, with the team's limit divided by `gateway_copies` (from config.yaml). It logs one ERROR, sets the `gateway_rate_limit_degraded` gauge to 1, and tries Redis again every 5 seconds. Once Redis answers, it logs that and goes back to shared limits.
+- **Why not reject everything** (fail closed, like auth in J3): auth answers "is this a real customer?", so letting requests through lets strangers in. Rate limiting answers "is this customer sending too much?", so the worst case is a few minutes of real teams over their share. Rejecting would turn a Redis restart into an outage for every team while the providers, Postgres and the gateway are all fine.
+- **Why not unlimited:** the per-copy bucket is the old "each copy counts on its own" problem, but split by the number of copies it's close enough for a few minutes. It reuses the same bucket code.
+- **What still protects us during the outage:** auth (only real teams get in), budgets in Postgres (3c), and the providers' own limits, which our fallback already handles.
+- **Industry:** Envoy's rate limit filter lets requests through by default when its rate limit service is down (`failure_mode_deny: false`).
+- **Interview line:** fail closed on security checks, fail open on protection checks, and make the degraded mode visible.
+- **Production terms:** *fail open*, *graceful degradation*, *single point of failure*, *blast radius*.
+
+### K5. How it's built
+- **Where it runs:** first thing in the chat endpoint, right after auth and before the model lookup, the cache and the providers.
+- **Limits come from `config.yaml`:** a default plus per-team overrides. Each bucket holds one minute's limit, so the burst size equals the per-minute limit. Limits will move to Postgres with budgets if they start changing often.
+- **One Lua script checks and takes from both buckets.** A request refused by the tokens bucket doesn't spend a coin from the requests bucket. Lua returns numbers as integers, so the script returns the fractional coin counts as strings.
+- **The time comes from the gateway, not Redis,** so the tests can control it. Gateway clocks are kept in sync by NTP to within milliseconds, and the script never lets elapsed time go negative, so a slightly wrong clock just means a slightly early or late refill.
+- **Keys expire after 120 s.** An expired bucket is the same as a full one, so idle teams cost no memory.
+- **The 429 looks like OpenAI's:** `code: rate_limit_exceeded`, `type: requests | tokens`, a `Retry-After` header, and the `x-ratelimit-limit-*` and `x-ratelimit-remaining-*` headers (also on successful responses). The OpenAI SDK sees the 429 and by default waits and retries twice on its own. A prompt bigger than the whole per-minute limit is told it's "too large", since waiting won't help.
+- **429 vs 503:** 429 means *you* are over your limit. 503 means the *providers* are limiting us (F).
+- **Settling:** `call_target` calls a callback with the provider's usage report: right away for a normal response, after the last chunk for a stream. The callback starts a small background task that charges the difference.
+- **What isn't settled:** a request where every provider failed keeps its estimate charged. So does a stream that broke before its usage report (v2: count the streamed chunks instead).
+- **Redis client:** `redis-py` 7 (`redis.asyncio`) with 100 ms timeouts, since a healthy Redis answers in well under a millisecond. It connects lazily, so the gateway starts even if Redis is down.
+- **Tests** use `fakeredis`, which runs the real Lua script, plus a test that runs the same steps through the Lua and the Python fallback and checks that they agree.
+- **Checked against real Redis:** with a 3 per minute limit, requests 1–3 got 200 and request 4 got 429 with `Retry-After: 15`. After stopping Redis, requests went on working with local limits, the degraded gauge went to 1, and one ERROR was logged. After restarting Redis, the gateway went back to the shared bucket, and the bucket still remembered the usage from before the outage (the named volume kept it).
+- **Production terms:** *Lua script*, *atomicity*, *clock skew*, *lazy connection*, *key expiry (TTL)*.

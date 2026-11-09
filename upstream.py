@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -68,9 +68,17 @@ def classify_exception(exc: Exception) -> Failure:
     return Failure("network", repr(exc))  # connection broke after sending; unsafe to retry
 
 
+UsageCallback = Callable[[Optional[dict]], None]
+
+
+def _ignore_usage(usage: Optional[dict]) -> None:
+    pass
+
+
 async def call_target(
-    http: httpx.AsyncClient, target: Target, payload: dict, stream: bool
+    http: httpx.AsyncClient, target: Target, payload: dict, stream: bool, on_usage: UsageCallback = _ignore_usage,
 ) -> Union[Response, Failure]:
+    """on_usage gets the provider's usage report once the answer is complete (None if it never arrived)."""
     payload = {**payload, "model": target.model}  # the provider's own name for the model
     headers = {"x-gateway-provider": target.provider.name}
     is_anthropic = target.provider.type == "anthropic"
@@ -82,7 +90,7 @@ async def call_target(
         if dropped:
             headers["x-gateway-dropped-params"] = ",".join(dropped)  # tell the client, don't hide it
     if stream:
-        return await _call_stream(http, target, payload, headers)
+        return await _call_stream(http, target, payload, headers, on_usage)
 
     try:
         upstream = await http.post(
@@ -101,10 +109,11 @@ async def call_target(
         body = upstream.json()
     if upstream.is_success:
         record_usage(target.deployment, body.get("usage"))
+        on_usage(body.get("usage"))
     return JSONResponse(status_code=upstream.status_code, content=body, headers=headers)
 
 
-async def _call_stream(http: httpx.AsyncClient, target: Target, payload: dict, headers: dict):
+async def _call_stream(http: httpx.AsyncClient, target: Target, payload: dict, headers: dict, on_usage: UsageCallback):
     started = time.perf_counter()
     try:
         upstream, error_body, first = await asyncio.wait_for(
@@ -130,7 +139,7 @@ async def _call_stream(http: httpx.AsyncClient, target: Target, payload: dict, h
     # First chunk is in hand: only now do we commit to this provider and send 200 to the client.
     lines, buffered = first
     return StreamingResponse(
-        relay_stream(_replay(buffered, lines), started, target.deployment),
+        relay_stream(_replay(buffered, lines), started, target.deployment, on_usage),
         media_type="text/event-stream",
         headers=headers,
         background=BackgroundTask(upstream.aclose),  # release the connection even if the client disconnects
@@ -170,7 +179,7 @@ async def _replay(buffered: list, rest):
         yield line
 
 
-async def relay_stream(lines, started: float, deployment: str):
+async def relay_stream(lines, started: float, deployment: str, on_usage: UsageCallback = _ignore_usage):
     """Forward SSE lines to the client unchanged, while watching them for TTFT and usage."""
     first_token_at = None
     usage = None
@@ -202,6 +211,7 @@ async def relay_stream(lines, started: float, deployment: str):
             if tokens > 1:  # needs the token count, so a client that leaves early gives no TPOT
                 TPOT.labels(deployment).observe((total - ttft) / (tokens - 1))
         record_usage(deployment, usage)
+        on_usage(usage)
         log.info(
             "stream done ttft=%s total=%.3fs usage=%s",
             f"{ttft:.3f}s" if ttft is not None else "n/a",

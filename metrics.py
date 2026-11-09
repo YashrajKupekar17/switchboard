@@ -36,6 +36,10 @@ TPOT = Histogram(
     buckets=TPOT_BUCKETS,
 )
 
+# --- rate limits (DECISIONS.md K) ---
+RATE_LIMITED = Counter("gateway_rate_limited_total", "Requests refused with 429, by team and limit", ["team", "limit"])
+RATE_LIMIT_DEGRADED = Gauge("gateway_rate_limit_degraded", "1 while Redis is unreachable and limits are per copy")
+
 # --- cost / usage ---
 TOKENS = Counter("gateway_tokens_total", "Tokens used, from the provider's usage report", ["deployment", "kind"])
 

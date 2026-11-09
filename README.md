@@ -27,7 +27,8 @@ flowchart LR
     LB --> G2[switchboard]
     G1 & G2 --> P1[OpenAI]
     G1 & G2 --> P2[Ollama / others]
-    G1 & G2 -. shared state, Phase 3 .-> R[(Redis)]
+    G1 & G2 -. rate limits .-> R[(Redis)]
+    G1 & G2 -. keys .-> PG[(Postgres)]
     G1 & G2 -. /metrics .-> PR[Prometheus] --> GF[Grafana]
 ```
 
@@ -69,6 +70,8 @@ Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven
 
 **Team API keys.** Each team gets its own `sbk_...` key and sends it the same way as an OpenAI key. Postgres stores only a SHA-256 hash of each key, so a leaked copy of the table can't be used to make requests. Each gateway copy caches lookups in memory (valid keys for 60 s, invalid ones for 10 s), so almost every request is checked without a database query. If Postgres is down, keys that aren't already cached are rejected rather than let through.
 
+**Rate limits per team.** Each team has two token buckets in Redis, shared by every gateway copy: requests per minute and tokens per minute. Before calling a provider, the gateway takes a rough guess of the prompt's tokens; when the answer is done, it charges the real number from the provider's usage report. A team over its limit gets a 429 shaped like OpenAI's, with `Retry-After`, so the OpenAI SDK waits and retries on its own. If Redis goes down, requests keep flowing: each gateway copy enforces its share of the limit by itself until Redis is back.
+
 **Fallback and retries.** The rule is to fall back only when the problem is the provider's, never the client's:
 
 | What happened | What switchboard does |
@@ -101,7 +104,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 cp .env.example .env                  # then add your OPENAI_API_KEY
 
-docker compose up -d                  # Postgres :5432, Prometheus :9090, Grafana :3000
+docker compose up -d                  # Postgres :5432, Redis :6379, Prometheus :9090, Grafana :3000
 .venv/bin/uvicorn main:app            # gateway on :8000
 
 .venv/bin/python scripts/keys.py create my-team "laptop"   # prints a key once
@@ -113,7 +116,7 @@ export SWITCHBOARD_API_KEY=sbk_...                        # the key it printed
 
 Then open Grafana at http://localhost:3000 and go to Dashboards > Gateway: on-call.
 
-Tests mock every provider and the key store, so they don't need a key, Postgres, or a network connection:
+Tests mock every provider, the key store and Redis, so they don't need a key, Postgres, Redis, or a network connection:
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -124,7 +127,7 @@ Tests mock every provider and the key store, so they don't need a key, Postgres,
 - [x] Phase 0: passthrough proxy
 - [x] Phase 1: streaming (SSE), TTFT, usage tracking
 - [x] Phase 2: config routing, fallback, retries, circuit breaker, metrics
-- [ ] Phase 3: per-team API keys (done), rate limits and budgets in Redis; everything runs in Docker
+- [ ] Phase 3: per-team API keys (done), rate limits in Redis (done), budgets; everything runs in Docker
 - [ ] Phase 4: exact and semantic caching
 - [ ] Phase 5: cascade routing (try a cheap model first, escalate when needed)
 - [ ] Phase 6: mock provider, load tests with Locust, published numbers
