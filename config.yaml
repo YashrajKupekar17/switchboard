@@ -84,3 +84,11 @@ budgets:
   default: {soft_usd: 50, max_usd: 60}
   teams:
     search: {soft_usd: 500, max_usd: 600}
+
+# Exact response cache (DECISIONS.md N). Off unless a team turns it on: a cached answer to a creative
+# prompt would stop that team ever getting a new one. Per request, the x-gateway-cache: on|off header
+# overrides this, and x-gateway-cache-ttl: <seconds> sets how long the answer is kept.
+cache:
+  default: {enabled: false, ttl: 3600}
+  teams:
+    search: {enabled: true}

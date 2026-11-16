@@ -20,20 +20,9 @@ The target is under 20 ms of added latency per request, at 50 requests per secon
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    C[Team services<br/>OpenAI SDK] --> LB[nginx]
-    LB --> G1[switchboard]
-    LB --> G2[switchboard]
-    LB --> G3[switchboard]
-    G1 & G2 & G3 --> P1[OpenAI]
-    G1 & G2 & G3 --> P2[Ollama / others]
-    G1 & G2 & G3 -. rate limits, spend totals .-> R[(Redis)]
-    G1 & G2 & G3 -. keys, usage ledger .-> PG[(Postgres)]
-    G1 & G2 & G3 -. /metrics .-> PR[Prometheus] --> GF[Grafana]
-```
+![switchboard architecture: team services call nginx, which load-balances across 3 gateway copies (auth, rate limit, budget, router). The copies call OpenAI, Groq, Anthropic and Ollama, keep rate limits and spend totals in Redis, keys and the usage ledger in Postgres, and are scraped by Prometheus, shown in Grafana.](docs/architecture.png)
 
-The gateway copies are stateless, so you can add or remove them freely. Anything that has to be shared between them (rate-limit counters, budgets, the cache) will live in Redis.
+The gateway copies are stateless, so you can add or remove them freely. Anything that has to be shared between them lives in Redis (rate-limit buckets and spend totals; cached answers in a second Redis) or Postgres (keys, the usage ledger).
 
 Each request goes through these steps, in this order:
 
@@ -75,6 +64,8 @@ Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven
 
 **Monthly budgets per team.** Every request is priced by the model that actually answered: input, cached input, cache writes and output each at their own price, from a table in `config.yaml`. Money is kept as whole micro-dollars, never floats. Each request is written to an append-only ledger in Postgres, and Redis keeps a running total per team so the check before each request is a single lookup. A team past its `soft_usd` gets a warning and an alert; at `max_usd` its requests get a 429 until the month resets. If Redis is down, the check is skipped, but spending is still recorded.
 
+**Response cache.** A team can turn on caching, by default in `config.yaml` or per request with `x-gateway-cache: on`. An identical request from the same team then gets the stored answer from Redis, at no cost and in a few milliseconds instead of a second or two. It's off unless asked for, because a cached answer to "write a poem" would stop a team ever getting a new one. Only complete answers from the first-choice model are stored: not errors, cut-off answers, refusals, or answers from a fallback provider. Teams never share entries. Cached answers live in their own Redis, which evicts the least-used answers when it's full, so they can never push out rate-limit data. Each hit records what it would have cost, so the savings show on the cost dashboard.
+
 **Fallback and retries.** The rule is to fall back only when the problem is the provider's, never the client's:
 
 | What happened | What switchboard does |
@@ -94,7 +85,7 @@ Clients can opt out of fallback with the `x-gateway-fallback: off` header.
 **Metrics.** A Prometheus endpoint at `/metrics`, plus two Grafana dashboards:
 
 - **On-call:** request rate, error rate, and p50/p95 latency; then fallbacks, attempts per provider, open breakers, in-flight requests, time to first token (TTFT), and time per output token (TPOT).
-- **Cost and usage:** tokens per model, plus spend and budget used per team. Prometheus alerts at 80% and 100% of a team's soft budget.
+- **Cost and usage:** tokens per model, spend and budget used per team, cache hit rate, and money saved by the cache. Prometheus alerts at 80% and 100% of a team's soft budget.
 
 Alerts are based on TTFT and TPOT rather than total latency. Total latency mostly reflects how long the answer was, so a jump might just mean someone asked for longer answers. TTFT and TPOT only go up when the provider itself gets slower.
 
@@ -104,7 +95,7 @@ You need Docker and an OpenAI API key. Python 3.9 or newer is only needed for th
 
 ```bash
 cp .env.example .env                  # then add your OPENAI_API_KEY
-docker compose up -d --build          # 3 gateway copies behind nginx on :8000, plus Postgres, Redis,
+docker compose up -d --build          # 3 gateway copies behind nginx on :8000, plus Postgres, 2 Redis,
                                       # Prometheus :9090 and Grafana :3000
 
 python3 -m venv .venv
@@ -134,7 +125,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 1: streaming (SSE), TTFT, usage tracking
 - [x] Phase 2: config routing, fallback, retries, circuit breaker, metrics
 - [x] Phase 3: per-team API keys, rate limits, budgets, and everything running in Docker
-- [ ] Phase 4: exact and semantic caching
+- [ ] Phase 4: exact caching (done), semantic caching
 - [ ] Phase 5: cascade routing (try a cheap model first, escalate when needed)
 - [ ] Phase 6: mock provider, load tests with Locust, published numbers
 

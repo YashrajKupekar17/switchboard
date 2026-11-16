@@ -17,9 +17,11 @@ services:
     environment:  # these override .env, which points at localhost for scripts run on the host
       DATABASE_URL: postgresql://gateway:${GATEWAY_DB_PASSWORD:-gateway}@postgres:5432/switchboard
       REDIS_URL: redis://redis:6379/0
+      CACHE_REDIS_URL: redis://redis-cache:6379/0
     depends_on:
       db-setup: {condition: service_completed_successfully}
       redis: {condition: service_started}
+      redis-cache: {condition: service_started}
     # No ports: only reachable inside Docker's network, through lb.
 
   db-setup:  # runs once, as the database owner, then exits: tables, and the restricted `gateway` user
@@ -66,11 +68,18 @@ services:
       timeout: 3s
       retries: 15
 
-  redis:
+  redis:  # rate-limit buckets and spend totals: small, and must never be evicted
     image: redis:8.6.8
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]  # the default, written down on purpose
     volumes:
       - redis-data:/data  # Redis writes its own snapshots here
     ports: ["127.0.0.1:6379:6379"]
+
+  redis-cache:  # cached answers only (DECISIONS.md N3): can be large, can be lost, so it evicts and never saves
+    image: redis:8.6.8
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lfu",
+              "--save", "", "--appendonly", "no"]
+    ports: ["127.0.0.1:6380:6379"]
 
 volumes:
   prometheus-data:  # a named volume: Docker keeps it until `docker compose down -v`

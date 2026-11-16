@@ -11,17 +11,18 @@ import httpx
 import redis.asyncio as redis
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 
 import budgets
+import cache
 from breaker import Breakers
 import keys
 import pricing
 import ratelimit
 from config import load_config
-from metrics import ATTEMPTS, FALLBACKS, RATE_LIMITED, RequestMetrics
+from metrics import ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, RequestMetrics
 from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
@@ -66,6 +67,12 @@ def open_redis() -> redis.Redis:
     return redis.from_url(url, socket_timeout=0.1, socket_connect_timeout=0.1)
 
 
+def open_cache_redis() -> redis.Redis:
+    # A separate Redis for cached answers (DECISIONS.md N3), so the cache's memory pressure can't evict rate limits.
+    url = os.environ.get("CACHE_REDIS_URL", "redis://localhost:6380/0")
+    return redis.from_url(url, socket_timeout=0.1, socket_connect_timeout=0.1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # One shared client for the whole app = one connection pool, reused by every request.
@@ -77,14 +84,23 @@ async def lifespan(app: FastAPI):
     app.state.limiter = ratelimit.RateLimiter(shared, CONFIG.limits_for, CONFIG.gateway_copies)
     app.state.budgets = budgets.Budgets(shared, await open_ledger(app.state.key_store), CONFIG.budget_for)
     app.state.budgets.start()  # writes buffered usage rows to Postgres every second
+    app.state.cache = cache.ResponseCache(open_cache_redis())
     yield
     await app.state.http.aclose()
     await app.state.budgets.stop()  # before the pool closes: writes the last rows
     await app.state.key_store.close()
     await app.state.limiter.close()
+    await app.state.cache.close()
 
 
-_settling = set()  # keeps a reference to each settle task until it finishes, so it isn't garbage collected
+_background = set()  # keeps a reference to each background task until it finishes, so it isn't garbage collected
+
+
+def _spawn(coro) -> None:
+    # Work that happens after the answer is sent (settling usage, storing in the cache): never delays the client.
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -138,6 +154,8 @@ async def chat_completions(
     http_request: Request,
     caller: keys.KeyInfo = Depends(require_key),
     x_gateway_fallback: Optional[str] = Header(default=None),
+    x_gateway_cache: Optional[str] = Header(default=None),
+    x_gateway_cache_ttl: Optional[str] = Header(default=None),
 ):
     payload = request.model_dump(exclude_none=True)
 
@@ -158,9 +176,7 @@ async def chat_completions(
 
     def settle(target, usage):
         # Called with the provider's real usage once the answer is done (for a stream, after the last chunk).
-        task = asyncio.create_task(_settle(caller, request.model, target, estimate, usage))
-        _settling.add(task)
-        task.add_done_callback(_settling.discard)
+        _spawn(_settle(caller, request.model, target, estimate, usage))
 
     targets = CONFIG.models.get(request.model)
     # Only configured names become a label: clients can send any string, and each one would be a new time series.
@@ -176,6 +192,25 @@ async def chat_completions(
         )
     if x_gateway_fallback == "off":  # opt-out: the client wants exactly the first target or an error
         targets = targets[:1]
+
+    # Exact cache, after the rate limit and budget checks (DECISIONS.md N). Off unless the team asked for it.
+    caching = cache.settings_from(CONFIG.cache_for(caller.team), x_gateway_cache, x_gateway_cache_ttl)
+    cache_headers = {"x-gateway-cache": "off"}
+    if caching.enabled:
+        key = cache.cache_key(caller.team, payload)  # before stream_options is added below: it isn't in the key
+        hit = await app.state.cache.get(key)
+        if hit:
+            wants_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
+            return _serve_hit(caller, request, hit, estimate, wants_usage, {
+                **_limit_headers(limits, decision), **_budget_headers(budget, spend)})
+        CACHE_LOOKUPS.labels(request.model, "miss").inc()
+        cache_headers = {"x-gateway-cache": "miss"}
+
+    def store(target, body):
+        # Only complete answers (N2). Called only for the first-choice target: a fallback answer is never stored.
+        if cache.storable(body):
+            CACHE_STORED.labels(request.model).inc()
+            _spawn(app.state.cache.put(key, body, target.deployment, caching.ttl))
 
     if request.stream:
         # Providers only send token usage at the end of a stream if asked to; we need it for cost tracking.
@@ -195,7 +230,8 @@ async def chat_completions(
             result = None
             try:
                 result = await call_target(
-                    app.state.http, target, payload, request.stream, on_usage=lambda u, t=target: settle(t, u)
+                    app.state.http, target, payload, request.stream, on_usage=lambda u, t=target: settle(t, u),
+                    on_complete=(lambda b, t=target: store(t, b)) if caching.enabled and i == 0 else None,
                 )
             finally:
                 if result is None:  # cancelled or crashed before the provider gave a verdict
@@ -211,6 +247,7 @@ async def chat_completions(
                     result.headers["x-gateway-attempts"] = _attempts(failures)
                 result.headers.update(_limit_headers(limits, decision))
                 result.headers.update(_budget_headers(budget, spend))
+                result.headers.update(cache_headers)
                 return result
 
             ATTEMPTS.labels(target.deployment, result.kind).inc()
@@ -230,6 +267,30 @@ async def chat_completions(
             break
 
     return _all_failed(request.model, failures)
+
+
+def _serve_hit(caller: keys.KeyInfo, request: ChatRequest, hit: cache.Hit, estimate: int, wants_usage: bool,
+               headers: dict) -> Response:
+    CACHE_LOOKUPS.labels(request.model, "hit").inc()
+    _spawn(_record_hit(caller, request.model, hit, estimate))
+    headers = {**headers, "x-gateway-cache": "hit", "age": str(hit.age),
+               "x-gateway-provider": hit.deployment.split("/", 1)[0]}
+    if request.stream:  # stored once as a whole answer, replayed as a stream (N1: stream isn't in the key)
+        return StreamingResponse(iter(cache.replay(hit.body, wants_usage)), media_type="text/event-stream",
+                                 headers=headers)
+    return JSONResponse(content=hit.body, headers=headers)
+
+
+async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int) -> None:
+    # A hit used no provider tokens: refund the tokens-per-minute estimate. The request itself still counted (N4).
+    await app.state.limiter.settle(caller.team, estimate, {"total_tokens": 0})
+    price = CONFIG.prices.get(hit.deployment)  # None if that model was removed from the config since
+    saved = pricing.cost_micros(price, hit.body.get("usage")) if price else 0
+    CACHE_SAVED.labels(caller.team).inc(saved / 1_000_000)
+    await app.state.budgets.record(
+        team=caller.team, key_id=caller.id, model=model, deployment=hit.deployment,
+        tokens=pricing.Tokens(0, 0, 0, 0), cost_micros=0, estimated=False, cache_hit=True, saved_micros=saved,
+    )
 
 
 async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage: Optional[dict]) -> None:

@@ -20,6 +20,7 @@ from starlette.background import BackgroundTask
 
 import anthropic_adapter
 from anthropic_adapter import StreamError, Unsupported
+from cache import assemble
 from config import Target
 from metrics import ATTEMPTS, TPOT, TTFT, record_usage
 
@@ -69,6 +70,7 @@ def classify_exception(exc: Exception) -> Failure:
 
 
 UsageCallback = Callable[[Optional[dict]], None]
+CompleteCallback = Optional[Callable[[dict], None]]  # gets the whole answer, OpenAI format, if it finished cleanly
 
 
 def _ignore_usage(usage: Optional[dict]) -> None:
@@ -77,8 +79,10 @@ def _ignore_usage(usage: Optional[dict]) -> None:
 
 async def call_target(
     http: httpx.AsyncClient, target: Target, payload: dict, stream: bool, on_usage: UsageCallback = _ignore_usage,
+    on_complete: CompleteCallback = None,
 ) -> Union[Response, Failure]:
-    """on_usage gets the provider's usage report once the answer is complete (None if it never arrived)."""
+    """on_usage gets the provider's usage report once the answer is complete (None if it never arrived).
+    on_complete gets the whole answer, only if it finished cleanly; for a stream that means [DONE] arrived."""
     payload = {**payload, "model": target.model}  # the provider's own name for the model
     headers = {"x-gateway-provider": target.provider.name}
     is_anthropic = target.provider.type == "anthropic"
@@ -90,7 +94,7 @@ async def call_target(
         if dropped:
             headers["x-gateway-dropped-params"] = ",".join(dropped)  # tell the client, don't hide it
     if stream:
-        return await _call_stream(http, target, payload, headers, on_usage)
+        return await _call_stream(http, target, payload, headers, on_usage, on_complete)
 
     try:
         upstream = await http.post(
@@ -110,10 +114,15 @@ async def call_target(
     if upstream.is_success:
         record_usage(target.deployment, body.get("usage"))
         on_usage(body.get("usage"))
+        if on_complete:
+            on_complete(body)
     return JSONResponse(status_code=upstream.status_code, content=body, headers=headers)
 
 
-async def _call_stream(http: httpx.AsyncClient, target: Target, payload: dict, headers: dict, on_usage: UsageCallback):
+async def _call_stream(
+    http: httpx.AsyncClient, target: Target, payload: dict, headers: dict, on_usage: UsageCallback,
+    on_complete: CompleteCallback,
+):
     started = time.perf_counter()
     try:
         upstream, error_body, first = await asyncio.wait_for(
@@ -139,7 +148,7 @@ async def _call_stream(http: httpx.AsyncClient, target: Target, payload: dict, h
     # First chunk is in hand: only now do we commit to this provider and send 200 to the client.
     lines, buffered = first
     return StreamingResponse(
-        relay_stream(_replay(buffered, lines), started, target.deployment, on_usage),
+        relay_stream(_replay(buffered, lines), started, target.deployment, on_usage, on_complete),
         media_type="text/event-stream",
         headers=headers,
         background=BackgroundTask(upstream.aclose),  # release the connection even if the client disconnects
@@ -179,19 +188,27 @@ async def _replay(buffered: list, rest):
         yield line
 
 
-async def relay_stream(lines, started: float, deployment: str, on_usage: UsageCallback = _ignore_usage):
+async def relay_stream(
+    lines, started: float, deployment: str, on_usage: UsageCallback = _ignore_usage, on_complete: CompleteCallback = None,
+):
     """Forward SSE lines to the client unchanged, while watching them for TTFT and usage."""
     first_token_at = None
     usage = None
+    chunks = [] if on_complete else None  # kept only when someone wants the whole answer (the cache)
+    finished = False
 
     try:
         async for line in lines:
-            if line.startswith("data: ") and line != "data: [DONE]":
+            if line == "data: [DONE]":
+                finished = True
+            elif line.startswith("data: "):
                 chunk = json.loads(line[len("data: "):])
                 if first_token_at is None and any(c["delta"].get("content") for c in chunk.get("choices", [])):
                     first_token_at = time.perf_counter()
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                if chunks is not None:
+                    chunks.append(chunk)
             yield line + "\n"
     except (httpx.HTTPError, StreamError) as exc:
         # Provider died mid-stream. The 200 and some chunks are already sent, so we can't fall back.
@@ -212,6 +229,8 @@ async def relay_stream(lines, started: float, deployment: str, on_usage: UsageCa
                 TPOT.labels(deployment).observe((total - ttft) / (tokens - 1))
         record_usage(deployment, usage)
         on_usage(usage)
+        if finished and chunks:  # a stream that broke or was abandoned is never handed on
+            on_complete(assemble(chunks))
         log.info(
             "stream done ttft=%s total=%.3fs usage=%s",
             f"{ttft:.3f}s" if ttft is not None else "n/a",

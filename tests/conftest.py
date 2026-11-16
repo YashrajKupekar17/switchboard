@@ -83,7 +83,15 @@ def fake_redis(monkeypatch):
 
 
 @pytest.fixture
-def client(key_store, fake_redis, ledger):
+def fake_cache_redis(monkeypatch):
+    # The response cache has its own Redis in production, so it gets its own fake server here too.
+    server = fakeredis.FakeServer()
+    monkeypatch.setattr(main, "open_cache_redis", lambda: fakeredis.FakeAsyncRedis(server=server))
+    return server
+
+
+@pytest.fixture
+def client(key_store, fake_redis, fake_cache_redis, ledger):
     # `with` runs lifespan, so the shared httpx client and the key cache exist. Every request is authenticated.
     with TestClient(main.app, headers=AUTH) as c:
         yield c

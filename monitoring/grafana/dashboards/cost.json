@@ -163,6 +163,77 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hit rate (requests with caching on)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Hits / all lookups. Requests with caching off aren't counted.",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "legendFormat": "{{model}}",
+          "expr": "sum by (model) (rate(gateway_cache_lookups_total{result=\"hit\"}[5m])) / sum by (model) (rate(gateway_cache_lookups_total[5m]))"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Saved by the cache in the selected range (USD)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "What cache hits would have cost at list price. The exact record is saved_micros in usage_ledger.",
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "legendFormat": "{{team}}",
+          "expr": "sum by (team) (increase(gateway_cache_saved_usd_total[$__range]))"
+        }
+      ]
     }
   ]
 }

@@ -46,6 +46,11 @@ BUDGET_USED = Gauge("gateway_budget_used_ratio", "Spend this month / soft budget
 LEDGER_BUFFERED = Gauge("gateway_ledger_buffered_rows", "Usage rows waiting to be written to Postgres")
 LEDGER_DROPPED = Counter("gateway_ledger_dropped_rows_total", "Usage rows lost because the buffer was full")
 
+# --- response cache (DECISIONS.md N) ---
+CACHE_LOOKUPS = Counter("gateway_cache_lookups_total", "Cache lookups for requests with caching on", ["model", "result"])
+CACHE_STORED = Counter("gateway_cache_stored_total", "Answers written to the cache", ["model"])
+CACHE_SAVED = Counter("gateway_cache_saved_usd_total", "What cache hits would have cost at list price", ["team"])
+
 # --- cost / usage ---
 TOKENS = Counter("gateway_tokens_total", "Tokens used, from the provider's usage report", ["deployment", "kind"])
 

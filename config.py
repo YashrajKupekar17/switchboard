@@ -5,6 +5,7 @@ from typing import Optional
 import yaml
 
 from budgets import Budget
+from cache import MAX_TTL, CacheSettings
 from pricing import Price
 from ratelimit import Limits
 
@@ -52,12 +53,17 @@ class Config:
     prices: dict[str, Price]  # deployment ("openai/gpt-4o-mini") -> price
     default_budget: Budget
     team_budgets: dict[str, Budget]
+    default_cache: CacheSettings
+    team_cache: dict[str, CacheSettings]
 
     def limits_for(self, team: str) -> Limits:
         return self.team_limits.get(team, self.default_limits)
 
     def budget_for(self, team: str) -> Budget:
         return self.team_budgets.get(team, self.default_budget)
+
+    def cache_for(self, team: str) -> CacheSettings:
+        return self.team_cache.get(team, self.default_cache)
 
 
 def load_config(path: str) -> Config:
@@ -98,6 +104,13 @@ def load_config(path: str) -> Config:
         if budget.max_usd < budget.soft_usd:
             raise RuntimeError(f"budget for {team!r}: max_usd must be at least soft_usd")
 
+    c = raw.get("cache", {})
+    default_cache = {"enabled": False, "ttl": 3600, **(c.get("default") or {})}  # off unless a team asks (N1)
+    team_cache = {team: CacheSettings(**{**default_cache, **v}) for team, v in (c.get("teams") or {}).items()}
+    for team, settings in [("default", CacheSettings(**default_cache)), *team_cache.items()]:
+        if not 1 <= settings.ttl <= MAX_TTL:
+            raise RuntimeError(f"cache for {team!r}: ttl must be between 1 and {MAX_TTL} seconds")
+
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})
     return Config(
@@ -109,4 +122,6 @@ def load_config(path: str) -> Config:
         prices=prices,
         default_budget=Budget(**default_budget),
         team_budgets=budgets,
+        default_cache=CacheSettings(**default_cache),
+        team_cache=team_cache,
     )

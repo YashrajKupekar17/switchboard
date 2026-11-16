@@ -563,3 +563,64 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 | A real OpenAI request and stream through nginx | Works. The stream arrived chunk by chunk (TTFT 1.44 s, total 2.05 s), so buffering is really off. |
 
 **Still to do:** Ollama's `base_url` is `localhost:11434`, which inside a container means the container itself. When Ollama is installed, it becomes `host.docker.internal:11434`.
+
+## N. Exact response cache (Phase 4a)
+
+### N1. Off unless the team asks, and the key is everything that can change the answer
+- **Who decides:** the team, not the gateway. Each team has a default in `config.yaml` (`cache.default` is off), and the `x-gateway-cache: on | off` header overrides it per request. `x-gateway-cache-ttl: <seconds>` sets how long the answer is kept (default 1 hour, at most 7 days).
+- **Why off by default:** a request with `temperature: 1` asks for a new answer each time. Cached, "write a poem about rain" returns the same poem forever and the team never notices. And most requests don't set `temperature` at all, where OpenAI's default is 1, so the gateway can't guess safely from the request either. Only the team knows whether a stored answer is acceptable.
+- **The key:** `cache:{team}:{sha256 of the request}`. The request is written as JSON with sorted keys and no spaces first (*canonicalisation*), so field order doesn't matter.
+- **List what stays out, not what goes in:** everything is in the key except `stream`, `stream_options` and `user`, which change how the answer is delivered or tagged, not what it says. If OpenAI adds a field that changes answers, it's in the key automatically. **A mistake in the key should cause a miss (it costs the normal price), never a wrong hit (an answer to a question nobody asked).**
+- **`stream` isn't in the key:** a streamed request and a normal one share an entry. A stream is stored as the complete answer it adds up to, and a streaming request that hits gets the stored answer replayed as SSE chunks, ending with `[DONE]`.
+- **The team is in the key:** with one shared cache, team A could get team B's stored answer, which might contain customer data, and whoever sends a prompt first would decide everyone's answer (*cache poisoning*). A shared cache would get more hits, but not worth a data leak. Users inside a team share entries; prompts with per-user data differ, so they don't collide.
+- **Industry:** Helicone (off unless `Helicone-Cache-Enabled: true`), Cloudflare AI Gateway (`cf-aig-skip-cache`, `cf-aig-cache-ttl`), LiteLLM (per-request `cache: {"no-cache": true}`), Portkey (`cache: {mode, max_age}` in a config). All of them: opt-in, per-request control, a TTL.
+- **Production terms:** *cache key*, *canonicalisation*, *opt-in caching*, *cache poisoning*, *tenant isolation*, *fail safe (miss over wrong hit)*.
+
+### N2. What gets stored
+- **Only complete answers:** every choice finished with `stop` or `tool_calls`.
+- **Not stored:**
+  - **Errors.** Some are temporary, so caching a 503 would turn a 2-second blip into an hour of failures.
+  - **Cut-off answers (`length`).** `max_tokens` is in the key, so the provider would give the same cut-off answer again, but clients treat truncation as a failure and retry with a bigger limit.
+  - **Refusals and content filters.** Filters have false positives and change over time.
+  - **Answers from a fallback provider.** The team asked for gpt-4o-mini, and Groq's answer was only the best available at that moment. Stored, it would keep being served after OpenAI recovers, with no sign of it. Storing it under Groq's name helps only requests whose first choice is Groq (rare); marking it and expiring it sooner still serves the wrong model. Fallbacks are rare, so skipping them loses few hits.
+  - **Streams that broke or were abandoned.** Only a stream that ended with `[DONE]` is stored.
+- **A side effect in the other direction:** answers stored before a provider outage keep being served during it, so for repeated requests the cache is one more layer of resilience.
+- **How:** `call_target` takes an `on_complete` callback that gets the whole answer. For a stream, `relay_stream` keeps the chunks (only when someone asked for them) and rebuilds the answer with `cache.assemble()`, merging tool-call arguments by their index. The callback is only passed for the first target, and storing runs in the background after the client already has its answer.
+
+### N3. Its own Redis, evicting by frequency
+- **TTL and eviction do different jobs:** a TTL keeps answers fresh (time). Eviction keeps memory bounded (Redis deletes keys when it reaches `maxmemory`). You need both: a TTL alone doesn't stop one busy hour of unique prompts filling memory.
+- **The trap:** `volatile-*` policies only evict keys with a TTL. That sounds like "only evict the cache", but in our design every key has a TTL, including rate-limit buckets (120 s) and spend totals (5 min). Under memory pressure a team's bucket could be evicted and come back full, loosening its limit. That's a bug that only shows up under memory pressure, the hardest kind to debug. Splitting into Redis database 0 and 1 doesn't help either: `maxmemory` covers the whole instance.
+- **Decision:** a second Redis, `redis-cache`, only for answers. `maxmemory 256mb`, `allkeys-lfu`, no snapshots or append-only file: losing the cache just means misses, so writing it to disk only costs time. The main `redis` stays `noeviction` with persistence, now written in the compose file on purpose.
+- **LFU over LRU:** LRU keeps whatever was used *last*, so one batch job sending 100,000 one-off prompts pushes every popular answer out (*cache pollution*). LFU keeps what's used *often*: a one-off prompt is the first to go.
+- **Failure:** if `redis-cache` is down, every lookup is a miss and requests go to the provider as usual (fail open, one ERROR log, retried every 5 s). Rate limits are unaffected, because they live in the other Redis.
+- **Production rule:** data with different durability needs goes in different stores. Isolation of failures comes with it.
+- **Production terms:** *TTL / expiry*, *eviction policy*, *LRU vs LFU*, *cache pollution*, *maxmemory*, *noeviction*.
+
+### N4. What a hit costs, and what people see
+- **Budget:** a hit costs the team $0. It still gets a ledger row, with `cache_hit = true`, `cost_micros = 0`, and `saved_micros`: what it would have cost at the list price of the model that originally answered. That's how the cache's saving is measured instead of claimed (*showback*). The two columns were added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, run by `scripts/setup_db.py`.
+- **Rate limit:** a hit uses one request from the requests-per-minute bucket (it still uses a connection, auth and a Redis lookup, so a team looping on a cached prompt is still limited), but its token estimate is refunded through the existing settle step, since it used none of our provider quota.
+- **Order:** `auth → rate limit → budget → cache → router`. A team over its budget is refused even for answers that would have been free. That keeps "over budget" simple to explain; revisit if teams ask.
+- **Response:** the stored body, unchanged, including the original `usage`, with `x-gateway-cache: hit`, `Age: <seconds since stored>`, and `x-gateway-provider` naming who originally answered. Misses say `x-gateway-cache: miss`, and requests with caching off say `off`.
+- **Metrics:** `gateway_cache_lookups_total{model, result}` (hit rate), `gateway_cache_stored_total{model}`, and `gateway_cache_saved_usd_total{team}`.
+
+### N5. Tests and the real check
+- **30 cache tests:**
+  - the key ignores field order and delivery fields, but changes with anything that can change the answer, including fields we've never heard of;
+  - teams never share keys;
+  - only complete answers are stored;
+  - a stream rebuilds into the same answer, and replays back into it;
+  - the header overrides the team default;
+  - fallbacks, errors and cut-off answers aren't stored;
+  - the ledger and rate-limit accounting of a hit;
+  - the cache Redis being down.
+- **Mutation checks:** leaving the team out of the key, storing fallback answers, and storing cut-off answers each made tests fail.
+- **Real run** (3 copies behind nginx, real OpenAI, `temperature: 0`):
+
+| Request | Result |
+|---|---|
+| #1, `x-gateway-cache: on` | miss, **2.18 s** (the OpenAI call) |
+| #2–#4, the same request | hits, **45 ms, 31 ms, 3 ms**. They landed on different copies (Prometheus: hits from all 3), so the cache is really shared. The first hit on each copy also paid for that copy's cold key cache and its first connection to `redis-cache`. Body byte-identical to #1. |
+| #5, no header | `off`, called OpenAI |
+| #6, the same request with `stream: true` | hit, replayed as SSE ending with `[DONE]` |
+| Ledger | the miss cost 4 µ$; each hit cost 0 and recorded `saved_micros = 4` |
+| `redis-cache` stopped | all requests 200, as misses; one ERROR per copy |
