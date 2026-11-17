@@ -21,10 +21,11 @@ from breaker import Breakers
 import keys
 import pricing
 import ratelimit
+import router
 import semantic
 from config import load_config
-from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, SEMANTIC_LOOKUPS,
-                     SEMANTIC_SIMILARITY, RequestMetrics)
+from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, ROUTE_DECISIONS,
+                     SEMANTIC_LOOKUPS, SEMANTIC_SIMILARITY, RequestMetrics)
 from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
@@ -192,7 +193,16 @@ async def chat_completions(
         # Called with the provider's real usage once the answer is done (for a stream, after the last chunk).
         _spawn(_settle(caller, request.model, target, estimate, usage))
 
-    targets = CONFIG.models.get(request.model)
+    # A route ("auto") picks a model from the request alone, before anything is called (DECISIONS.md P).
+    route_headers = {}
+    route = CONFIG.routes.get(request.model)
+    if route:
+        chosen, reason = router.choose(route, payload, estimate)
+        ROUTE_DECISIONS.labels(route.name, chosen, reason).inc()
+        route_headers = {"x-gateway-routed-to": chosen, "x-gateway-route-reason": reason}
+        targets = CONFIG.models[chosen]
+    else:
+        targets = CONFIG.models.get(request.model)
     # Only configured names become a label: clients can send any string, and each one would be a new time series.
     http_request.state.metrics_model = request.model if targets else "unknown"
     if not targets:
@@ -291,6 +301,7 @@ async def chat_completions(
                 result.headers.update(_limit_headers(limits, decision))
                 result.headers.update(_budget_headers(budget, spend))
                 result.headers.update(cache_headers)
+                result.headers.update(route_headers)
                 return result
 
             ATTEMPTS.labels(target.deployment, result.kind).inc()

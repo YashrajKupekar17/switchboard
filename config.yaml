@@ -56,6 +56,20 @@ models:
     - provider: groq
       model: openai/gpt-oss-120b
 
+# Routes (DECISIONS.md P): a client that asks for `auto` lets the gateway pick the model. Asking for a model
+# by name always gets that model. The pick is made from the request alone, before any model is called:
+# `default` unless any rule under `upgrade_if` matches. The rules are the same for every team, and they're
+# starting guesses, not measured yet. Every response says what was picked and why (x-gateway-routed-to,
+# x-gateway-route-reason).
+routes:
+  auto:
+    default: fast
+    upgrade_to: strong
+    upgrade_if:
+      has_tools: true          # the request offers tools
+      min_turns: 6             # 6+ user messages in the conversation
+      min_prompt_tokens: 3000  # a long prompt (estimated tokens)
+
 # Per-team limits (DECISIONS.md K). Each team has two buckets: requests per minute and tokens per minute.
 # A bucket holds one minute's worth, so a team can burst up to its limit, then gets a steady rate.
 rate_limits:

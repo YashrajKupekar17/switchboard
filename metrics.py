@@ -67,6 +67,12 @@ SEMANTIC_STEP_SECONDS = Histogram(
     buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2),
 )
 
+# --- routing (DECISIONS.md P) ---
+# reason is one of a fixed set (default, tools, turns, long_prompt), so it's safe as a label.
+ROUTE_DECISIONS = Counter(
+    "gateway_route_decisions_total", "Which model a route picked, and which rule decided", ["route", "model", "reason"],
+)
+
 # --- cost / usage ---
 TOKENS = Counter("gateway_tokens_total", "Tokens used, from the provider's usage report", ["deployment", "kind"])
 

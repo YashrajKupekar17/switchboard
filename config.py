@@ -8,6 +8,7 @@ from budgets import Budget
 from cache import MAX_TTL, CacheSettings
 from pricing import Price
 from ratelimit import Limits
+from router import Route, Rules
 from semantic import MODES as SEMANTIC_MODES
 
 PROVIDER_TYPES = ("openai", "anthropic")  # "openai" = anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM...)
@@ -56,6 +57,7 @@ class Config:
     team_budgets: dict[str, Budget]
     default_cache: CacheSettings
     team_cache: dict[str, CacheSettings]
+    routes: dict[str, Route]  # route name ("auto") -> how it picks a model
 
     def limits_for(self, team: str) -> Limits:
         return self.team_limits.get(team, self.default_limits)
@@ -127,6 +129,15 @@ def load_config(path: str) -> Config:
             # Questions are embedded with OpenAI's API (DECISIONS.md O4), so it needs the openai provider's key.
             raise RuntimeError(f"cache for {team!r}: the semantic cache needs the 'openai' provider configured")
 
+    routes = {}
+    for name, r in (raw.get("routes") or {}).items():
+        if name in models:
+            raise RuntimeError(f"route {name!r}: already a model name, so clients couldn't tell which they get")
+        for field in ("default", "upgrade_to"):
+            if r.get(field) not in models:
+                raise RuntimeError(f"route {name!r}: {field} must be a model under `models`, got {r.get(field)!r}")
+        routes[name] = Route(name, r["default"], r["upgrade_to"], Rules(**(r.get("upgrade_if") or {})))
+
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})
     return Config(
@@ -140,4 +151,5 @@ def load_config(path: str) -> Config:
         team_budgets=budgets,
         default_cache=CacheSettings(**default_cache),
         team_cache=team_cache,
+        routes=routes,
     )

@@ -747,3 +747,105 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   Metrics: 4 judge calls, 2 approved, 2 rejected; judge 0.70 s and embedding 0.46 s on average. In shadow mode the same pairs were saved with verdicts 1.0 and 0, and nothing was served.
 - **Tests:** 31 semantic tests. Mutation checks: ignoring the judge's "no", never asking it, ignoring the threshold, and adding "yes" and "no" probabilities together each made tests fail.
 - **Production terms:** *two-stage retrieval*, *verifier*, *LLM-as-judge*, *logprobs as confidence*, *break-even analysis*.
+
+### O11. The same experiment on public data: 500 Quora Question Pairs
+- **Why:** O7 and O9 used 40 pairs I wrote myself, half of them traps. A fair objection is "you built a test the embedding would fail." So, the same comparison on pairs nobody here wrote: 500 random pairs from the GLUE QQP **validation** split (195 labelled duplicate, 305 not), 2026-11-17. The validation split, because the cross-encoder was trained on QQP's training split.
+
+| Checker | Served | Wrong (by Quora's label) | Precision | Recall | Time per check |
+|---|---|---|---|---|---|
+| Embedding ≥ 0.95 | 19 | 2 | 89% | 9% | (the lookup) |
+| Embedding ≥ 0.85 | 115 | 22 | 81% | 48% | |
+| Cross-encoder (Quora-trained) ≥ 0.5 | 185 | 18 | 90% | 86% | 18 ms (laptop CPU) |
+| gpt-4o-mini judge, P(yes) ≥ 0.9 | 106 | 10 | 91% | 49% | 658 ms median |
+| The gateway as built (≥ 0.70, then the judge) | 104 | 10 | 90% | 48% | |
+
+- **The embedding:** better than on our trap-heavy set, as expected, but the same shape: getting to zero wrong takes 0.98, which catches 3% of duplicates. Safe or useful, not both.
+- **The cross-encoder wins here, and that's the point:** it was trained on Quora's idea of "duplicate", so on Quora pairs it's at home (86% recall at 90% precision). On our support-style pairs it failed (O9). A trained checker learns *someone's* definition of "same", and it holds only on data like its training data.
+- **The judge is stricter than Quora.** Quora labels pairs duplicate when they'd be merged into one thread ("same topic"). The judge's prompt asks whether *the same answer would be correct for both*, which is what a cache needs. Many of its 99 rejected duplicates are right to be rejected for a cache: "Is coffee fattening?" vs "Is black coffee fattening?", "benefits and drawbacks of cultural diversity" vs "downsides of...", "How long until Spotify comes to India?" vs "Is Spotify available in India?". Some are over-strict ("Did Hillary Clinton ever lie...?" vs "...ever blatantly lied...?").
+- **Its 10 "wrong" hits, read by hand:** about 4 are clearly duplicates the label calls different ("How do you live life on the edge?" vs "How do I..."), so label noise; about 3 are borderline ("Why do I always feel a headache?" vs "Why do we feel headache?"); about 3 are real mistakes. The most interesting two are the same words pointing at something the text doesn't contain: "How do I make videos like *this*?" and "How can I solve *this* question of aldehydes?". Identical wording, different answers. In the gateway an attachment would be part of the request and land in a different partition, but plain-text references ("this", "my order") are exactly what a cache can't see.
+- **So, measured honestly:** on realistic pairs the judge is roughly 90% precise against noisy labels (higher after reading them), and conservative: it serves about half the duplicates. The cross-encoder is faster and catches more, but only on the kind of data it was trained on. "Which checker" depends on whose questions they are, which is why shadow mode and labelled pairs from the team's own traffic come before any of this is turned on.
+- **Not committed:** the QQP sample itself (Quora's data terms); the pairs were fetched from the Hugging Face datasets API (`nyu-mll/glue`, config `qqp`, validation, seed 17, 10 random offsets × 50 rows).
+
+### O12. The third test: 500 PAWS pairs, out of domain for everyone
+- **Why:** Quora is home turf for the cross-encoder (trained on Quora's training split; the validation split is different pairs but the same kind of data, so in-domain). PAWS (Google) is a fair, out-of-domain test for all three: sentence pairs built from the same words where swapping them sometimes changes the meaning ("flights from New York to Florida" / "from Florida to New York"), i.e. hard negatives at scale. 500 random pairs from the labelled test split (232 paraphrases), 2026-11-17.
+- **Limit:** PAWS pairs are long Wikipedia sentences, not questions, and the judge's prompt (unchanged, so this tests what's shipped) talks about questions.
+
+| Checker | Served | Wrong | Precision | Recall | Time |
+|---|---|---|---|---|---|
+| Embedding ≥ 0.95 | 305 | 139 | 54% | 72% | |
+| Embedding ≥ 0.99 | 51 | 8 | 84% | 19% | |
+| Cross-encoder (Quora-trained) ≥ 0.5 | 445 | 238 | 47% | 89% | 19 ms |
+| gpt-4o-mini judge, P(yes) ≥ 0.9 | 180 | 36 | **80%** | 62% | 643 ms median |
+
+- **The embedding is a coin flip here:** nearly every pair scores above 0.85, paraphrase or not, because the words are the same. No threshold reaches even 85% precision.
+- **The cross-encoder too (47%).** Its 90% on Quora was home advantage; away from Quora-style questions it's no better than the embedding. That settles the question O11 left open.
+- **The judge is the only one that holds up, but it isn't solved:** 80% precision. Its mistakes are subtle swaps in long sentences: "popular journalist X and British novelist Y" vs "British journalist X and popular novelist Y"; "the light region of each heavy or variable chain" vs "the variable region of each heavy or light chain". It also rejects some true paraphrases on tiny differences ("the two above controls" vs "the above two controls").
+
+**All three tests side by side:**
+
+| Checker | My 40 (support questions) | Quora 500 (real questions) | PAWS 500 (word swaps) |
+|---|---|---|---|
+| Embedding ≥ 0.95 (precision / recall) | 0% / 0% | 89% / 9% | 54% / 72% |
+| Cross-encoder (Quora-trained) | 78% / 35% | 90% / 86% | 47% / 89% |
+| gpt-4o-mini judge | 100% / 90% | 91% / 49% | 80% / 62% |
+
+- **What the three together say:**
+  1. **A similarity threshold means nothing on its own.** 0.95 served nothing useful on one set, 9% of duplicates at 89% precision on another, and a coin flip on the third. The number only means something for a given model *and* a given kind of traffic.
+  2. **A trained checker is only as good as the match to its training data.** Best of the three at home, worst away.
+  3. **The LLM judge is the most robust, not perfect,** and the slowest (~650 ms). Its weak spot, who-did-what-to-whom swaps in long sentences, is rarer in short user questions than in PAWS, but not absent ("convert miles to km" vs "km to miles").
+  4. Which is why the gateway ships it off by default, with shadow mode, and why a team's own labelled pairs are the test that counts.
+
+## P. Model routing: `auto` (Phase 5a)
+
+### P1. A router, not a cascade
+- **The two options:**
+  - A **cascade** tries a cheap model, has a judge check the answer, and calls the expensive model if the judge says no. It decides after seeing an answer.
+  - A **router** looks only at the request, predicts easy or hard, and calls one model. It decides before anything is called.
+- **Why not a cascade:**
+  - **Money:** with cheap = 1, judge = 1, expensive = 15, a request costs 2 + 15p, where p is the share escalated. It saves money only while p < 13/15 ≈ 87%. Real numbers are worse, because the judge has to read the whole answer.
+  - **Time:** every request waits for the cheap model's full answer and the judge, even when nothing escalates. An escalated one pays for three calls.
+  - **Streaming:** the cheap answer has to be held back until the judge decides, so the first token comes seconds later on every request. Streaming exists to avoid exactly that.
+  - **The judge's job is harder than the cache judge's:** "is this answer good enough?" has no reference to compare against. For a hard question the judge would need to be about as strong as the expensive model.
+- **The router's cost:** it only guesses, since it never sees an answer. Measuring how often it guesses wrong is P5.
+- **Industry:** FrugalGPT (Stanford) is the cascade paper. RouteLLM (LMSYS), Not Diamond (behind OpenRouter's `auto`) and Martian are routers.
+
+### P2. Rules first, a trained classifier later
+- **Options:**
+  1. **Rules** on the request: tools, conversation length, prompt length. Portkey's conditional routing and most gateways work this way.
+  2. **Semantic routing:** embed the request and match it to example prompts per route. Kong's AI Gateway does this.
+  3. **A trained classifier:** RouteLLM, Not Diamond, Martian. Trained on large preference datasets such as Chatbot Arena votes.
+- **Decision: rules.** A classifier needs labelled data ("was the cheap answer good enough for this request?"), and we have none. Rules need no data, cost ~0 ms, and anyone can read why a request went where it did.
+- **The data comes later from shadow mode (P5).** With it, a classifier or semantic routing can be trained and compared against the rules on the same pairs, the way the cache's checkers were compared in O9-O12.
+- **Jev (TypeSafe AI, launched 2026-09):** a decision model that answers "which of these categories?" with probabilities, from the prompt alone. Cheap ($0.042 per 1M input tokens), but about 0.65 s per call in the one independent test, closed and waitlisted, two months old, and 67.8% vs 74.1% for the best LLM on an independent benchmark. Not for v1: it would add an external call to every `auto` request, and we can't tell yet whether it beats rules. A candidate to test against the rules once P5 has data.
+
+### P3. Opt-in through a name, rules shared by every team
+- **`model: "auto"`** is how a team opts in. Asking for a model by name always gets that model: the gateway only overrides a choice the team handed over. A wrong guess changes the answer a team gets, so the team decides, as with the cache (N1).
+- **Rules are the same for every team for now.** Per-team rules need per-team data to set them, which doesn't exist yet. One set of rules is easier to reason about while there's nothing to measure them with.
+- **Config:** `routes.auto` in `config.yaml`, with `default`, `upgrade_to` and `upgrade_if`. Both models must be names under `models`, so fallbacks, prices and breakers work unchanged. A route can't use a model's name, or clients couldn't tell which they get.
+
+### P4. The rules, and what they're based on
+- **Upgrade to the strong model if any one matches:**
+  - **The request offers tools.** Calling tools correctly is where small models fail most.
+  - **6 or more user messages.** Long sessions tend to be the hard ones (debugging, multi-step tasks).
+  - **3,000 or more estimated prompt tokens.** More input to keep track of.
+- **These are starting guesses, not measurements.** Short questions can still be hard ("prove there are infinitely many primes"), and long ones easy ("summarise this email"). The numbers are in the config so they can be changed once P5 measures them. Each rule can be turned off with `null` or `false`.
+- **What the client sees:** `x-gateway-routed-to: fast` and `x-gateway-route-reason: tools`, so a team can see every decision. The ledger keeps `model = auto` and the deployment that answered, so the cost is charged at the chosen model's price.
+- **Metric:** `gateway_route_decisions_total{route, model, reason}`.
+- **Order:** auth → rate limit → budget → route → exact cache → semantic cache → router (fallbacks). The route is picked before the cache, so the same request always gets the same route and the same cache key.
+
+### P5. Next: is the cheap answer good enough? (shadow mode, not built yet)
+- **Shadow mode:** serve the model the team asked for, record what the router would have picked, and for a sample of requests where it would have picked the cheap model, generate the cheap answer too (about 1/15 of the cost of the real request).
+- **A pairwise judge:** "here's the question, answer A (strong) and answer B (cheap). Is B as good as A?" Comparing against a reference is far easier than grading one answer alone, which is how MT-Bench and Chatbot Arena evaluate models. Asked twice with the order swapped, against *position bias*. It runs offline, never on a request's path.
+- **The result:** per team, "the cheap answer was as good in X% of cases", and labelled data to train or test a better router (P2).
+
+### P6. Tests and the real check
+- **15 tests:** each rule, just under each rule, only user messages counting as turns, rules switched off, config validation, `auto` calling the chosen model with the right headers, a named model never being routed, and the ledger charging the chosen model.
+- **Mutation checks:** off-by-one on the turn count, counting every message as a turn, and always calling the default model each made tests fail.
+- **Real run** (3 copies behind nginx, real OpenAI):
+
+| Request | Routed to | Reason | Ledger |
+|---|---|---|---|
+| "Say hi in 3 words." | fast (gpt-4o-mini) | default | 5 µ$ |
+| A weather question with a `get_weather` tool | strong (gpt-4o) | tools | 250 µ$ |
+| "Count to 3.", streamed | fast (gpt-4o-mini) | default | 7 µ$ |
+
