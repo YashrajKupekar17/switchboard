@@ -21,8 +21,10 @@ from breaker import Breakers
 import keys
 import pricing
 import ratelimit
+import semantic
 from config import load_config
-from metrics import ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, RequestMetrics
+from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, SEMANTIC_LOOKUPS,
+                     SEMANTIC_SIMILARITY, RequestMetrics)
 from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
@@ -73,6 +75,15 @@ def open_cache_redis() -> redis.Redis:
     return redis.from_url(url, socket_timeout=0.1, socket_connect_timeout=0.1)
 
 
+def open_semantic(http: httpx.AsyncClient, cache_redis: redis.Redis) -> Optional[semantic.SemanticCache]:
+    # Questions are embedded with OpenAI (DECISIONS.md O4). Without that provider, no team can turn it on (config checks).
+    openai = CONFIG.providers.get("openai")
+    if openai is None:
+        return None
+    return semantic.SemanticCache(semantic.Embedder(http, openai.base_url, openai.api_key),
+                                  semantic.RedisVectors(cache_redis))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # One shared client for the whole app = one connection pool, reused by every request.
@@ -84,7 +95,9 @@ async def lifespan(app: FastAPI):
     app.state.limiter = ratelimit.RateLimiter(shared, CONFIG.limits_for, CONFIG.gateway_copies)
     app.state.budgets = budgets.Budgets(shared, await open_ledger(app.state.key_store), CONFIG.budget_for)
     app.state.budgets.start()  # writes buffered usage rows to Postgres every second
-    app.state.cache = cache.ResponseCache(open_cache_redis())
+    cache_redis = open_cache_redis()  # one pool for both caches: they live in the same Redis
+    app.state.cache = cache.ResponseCache(cache_redis)
+    app.state.semantic = open_semantic(app.state.http, cache_redis)
     yield
     await app.state.http.aclose()
     await app.state.budgets.stop()  # before the pool closes: writes the last rows
@@ -199,18 +212,43 @@ async def chat_completions(
     if caching.enabled:
         key = cache.cache_key(caller.team, payload)  # before stream_options is added below: it isn't in the key
         hit = await app.state.cache.get(key)
+        wants_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
+        hit_headers = {**_limit_headers(limits, decision), **_budget_headers(budget, spend)}
         if hit:
-            wants_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
-            return _serve_hit(caller, request, hit, estimate, wants_usage, {
-                **_limit_headers(limits, decision), **_budget_headers(budget, spend)})
+            CACHE_LOOKUPS.labels(request.model, "hit").inc()
+            return _serve_hit(caller, request, hit, estimate, wants_usage, {**hit_headers, "x-gateway-cache": "hit"})
         CACHE_LOOKUPS.labels(request.model, "miss").inc()
         cache_headers = {"x-gateway-cache": "miss"}
+
+    # Semantic cache, only after an exact miss: an exact hit is one Redis read, this is an API call (DECISIONS.md O).
+    lookup = vector = shadow = None
+    if caching.enabled and caching.semantic != "off" and app.state.semantic:
+        lookup = semantic.lookup_for(caller.team, payload)
+    if lookup:
+        vector, match = await app.state.semantic.find(lookup)
+        if match:
+            SEMANTIC_SIMILARITY.labels(caller.team).observe(match.similarity)
+        close_enough = match is not None and match.similarity >= caching.threshold
+        result = "skipped" if vector is None else "miss" if not close_enough else (
+            "hit" if caching.semantic == "on" else "shadow_hit")
+        SEMANTIC_LOOKUPS.labels(request.model, result).inc()
+        if result == "hit":
+            log.info("semantic hit team=%s similarity=%.4f entry=%s", caller.team, match.similarity, match.key)
+            return _serve_hit(caller, request, match.hit, estimate, wants_usage, {
+                **hit_headers, "x-gateway-cache": "semantic-hit",
+                "x-gateway-cache-similarity": f"{match.similarity:.4f}"})
+        if caching.semantic == "shadow" and match and match.similarity >= semantic.SHADOW_FLOOR:
+            shadow = match  # keep the pair once the real answer is in, even under the threshold: it's for picking one (O2)
 
     def store(target, body):
         # Only complete answers (N2). Called only for the first-choice target: a fallback answer is never stored.
         if cache.storable(body):
             CACHE_STORED.labels(request.model).inc()
             _spawn(app.state.cache.put(key, body, target.deployment, caching.ttl))
+            if vector:
+                _spawn(app.state.semantic.put(lookup, vector, body, target.deployment, caching.ttl))
+            if shadow:
+                _spawn(app.state.semantic.save_shadow(caller.team, _shadow_record(request.model, lookup, shadow, body)))
 
     if request.stream:
         # Providers only send token usage at the end of a stream if asked to; we need it for cost tracking.
@@ -271,14 +309,26 @@ async def chat_completions(
 
 def _serve_hit(caller: keys.KeyInfo, request: ChatRequest, hit: cache.Hit, estimate: int, wants_usage: bool,
                headers: dict) -> Response:
-    CACHE_LOOKUPS.labels(request.model, "hit").inc()
     _spawn(_record_hit(caller, request.model, hit, estimate))
-    headers = {**headers, "x-gateway-cache": "hit", "age": str(hit.age),
-               "x-gateway-provider": hit.deployment.split("/", 1)[0]}
+    headers = {**headers, "age": str(hit.age), "x-gateway-provider": hit.deployment.split("/", 1)[0]}
     if request.stream:  # stored once as a whole answer, replayed as a stream (N1: stream isn't in the key)
         return StreamingResponse(iter(cache.replay(hit.body, wants_usage)), media_type="text/event-stream",
                                  headers=headers)
     return JSONResponse(content=hit.body, headers=headers)
+
+
+def _answer_text(body: dict) -> Optional[str]:
+    choices = body.get("choices") or [{}]
+    return (choices[0].get("message") or {}).get("content")
+
+
+def _shadow_record(model: str, lookup: semantic.Lookup, match: semantic.Match, body: dict) -> dict:
+    # One would-be hit, for labelling later: was the stored answer right for the new question? (scripts/semantic_eval.py)
+    return {
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "model": model,
+        "similarity": round(match.similarity, 4), "question": lookup.question, "matched_question": match.question,
+        "cached_answer": _answer_text(match.hit.body), "fresh_answer": _answer_text(body), "same": None,
+    }
 
 
 async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int) -> None:

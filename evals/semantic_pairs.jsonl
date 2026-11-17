@@ -1,0 +1,40 @@
+{"question": "capital of france", "matched_question": "What's the capital of France?", "same": true}
+{"question": "how do i reset my password", "matched_question": "How can I reset my password?", "same": true}
+{"question": "What are your opening hours?", "matched_question": "When are you open?", "same": true}
+{"question": "Do you ship to Canada?", "matched_question": "Can I get my order delivered to Canada?", "same": true}
+{"question": "How long does shipping take?", "matched_question": "What is the delivery time?", "same": true}
+{"question": "Can I pay with PayPal?", "matched_question": "Do you accept PayPal?", "same": true}
+{"question": "What is your refund policy?", "matched_question": "How do refunds work?", "same": true}
+{"question": "how to change my email address", "matched_question": "How do I update the email on my account?", "same": true}
+{"question": "Is there a free trial?", "matched_question": "Do you offer a free trial?", "same": true}
+{"question": "What does HTTP 404 mean?", "matched_question": "What is a 404 error?", "same": true}
+{"question": "Explain what a token bucket is", "matched_question": "What is the token bucket algorithm?", "same": true}
+{"question": "who wrote pride and prejudice", "matched_question": "Who is the author of Pride and Prejudice?", "same": true}
+{"question": "How many days are in a leap year?", "matched_question": "number of days in a leap year", "same": true}
+{"question": "What's the boiling point of water?", "matched_question": "At what temperature does water boil?", "same": true}
+{"question": "How do I delete my account?", "matched_question": "I want to close my account, how?", "same": true}
+{"question": "Where can I find my invoices?", "matched_question": "How do I download my invoices?", "same": true}
+{"question": "Do you have a mobile app?", "matched_question": "Is there an app for iPhone or Android?", "same": true}
+{"question": "What is the difference between TCP and UDP?", "matched_question": "TCP vs UDP", "same": true}
+{"question": "How do I contact support?", "matched_question": "How can I reach customer support?", "same": true}
+{"question": "Translate 'thank you' into Spanish", "matched_question": "How do you say thank you in Spanish?", "same": true}
+{"question": "How do I cancel my subscription?", "matched_question": "How do I cancel my order?", "same": false}
+{"question": "What's the status of order 5678?", "matched_question": "What's the status of order 1234?", "same": false}
+{"question": "What is the capital of Austria?", "matched_question": "What is the capital of Australia?", "same": false}
+{"question": "How do I enable two-factor authentication?", "matched_question": "How do I disable two-factor authentication?", "same": false}
+{"question": "Can I get a refund after 30 days?", "matched_question": "Can I get a refund within 30 days?", "same": false}
+{"question": "Do you ship to Canada?", "matched_question": "Do you ship to Mexico?", "same": false}
+{"question": "What's the weather in Paris today?", "matched_question": "What's the weather in Paris tomorrow?", "same": false}
+{"question": "Convert 10 miles to kilometers", "matched_question": "Convert 10 kilometers to miles", "same": false}
+{"question": "How do I upgrade to the Pro plan?", "matched_question": "How do I downgrade from the Pro plan?", "same": false}
+{"question": "Is the API rate limit per key or per team?", "matched_question": "Is the API rate limit per minute or per hour?", "same": false}
+{"question": "Why is my payment not going through?", "matched_question": "Why was I charged twice?", "same": false}
+{"question": "Write a Python function to reverse a list", "matched_question": "Write a Python function to sort a list", "same": false}
+{"question": "Who was the first president of the United States?", "matched_question": "Who is the current president of the United States?", "same": false}
+{"question": "What are your opening hours on Sunday?", "matched_question": "What are your opening hours?", "same": false}
+{"question": "I don't want to renew my plan", "matched_question": "I want to renew my plan", "same": false}
+{"question": "How much does the Basic plan cost?", "matched_question": "How much does the Enterprise plan cost?", "same": false}
+{"question": "How do I add a user to my team?", "matched_question": "How do I remove a user from my team?", "same": false}
+{"question": "What does HTTP 500 mean?", "matched_question": "What does HTTP 503 mean?", "same": false}
+{"question": "Is the gift card refundable?", "matched_question": "Is the gift card transferable?", "same": false}
+{"question": "How long does shipping take to India?", "matched_question": "How long does shipping take?", "same": false}

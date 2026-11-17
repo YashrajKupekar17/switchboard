@@ -399,7 +399,7 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Fail closed when Postgres is down:** a key that isn't cached gets `503 auth_unavailable`; cached keys keep working until their entry expires. Failing open would let anyone in during an outage. *(This settles the auth part of the open "fail-open vs fail-closed" question.)* **v2:** keep serving recently valid keys past their expiry while Postgres is down (*stale-if-error*).
 - **Cheap checks first:** anything that isn't `sbk_` plus 32 characters gets a 401 without touching the database, and the invalid-key cache is capped at 10,000 entries, so random keys can't fill the gateway's memory.
 - **Revoking is a soft delete:** `UPDATE api_keys SET revoked_at = now() WHERE id = ...`. The dashboard (for now, `scripts/keys.py`) works with key IDs and visible prefixes, never full keys. Rows are kept, because spend history will point at them.
-- **Schema:** created at startup with `CREATE TABLE IF NOT EXISTS`. **v2:** a migration tool (Alembic) once the schema starts changing.
+- **Schema:** created by `scripts/setup_db.py` with `CREATE TABLE IF NOT EXISTS`, run as the database owner (M3); the gateway only checks the tables exist. **v2:** a migration tool (Alembic) once the schema starts changing.
 - **Driver:** asyncpg with a pool of 1-5 connections and a 2 s query timeout. Opening a new connection per query would cost 5-20 ms.
 - **Tests** use an in-memory fake key store, so they need no Postgres. The real path was checked by hand against Postgres in Docker.
 - **Production terms:** *fail closed*, *stale-if-error*, *soft delete*, *schema migration*, *connection pool*, *FastAPI dependency*.
@@ -624,3 +624,87 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 | #6, the same request with `stream: true` | hit, replayed as SSE ending with `[DONE]` |
 | Ledger | the miss cost 4 µ$; each hit cost 0 and recorded `saved_micros = 4` |
 | `redis-cache` stopped | all requests 200, as misses; one ERROR per copy |
+
+## O. Semantic cache (Phase 4b)
+
+### O1. What it is, and why it's dangerous
+- **The idea:** a question that means the same as a stored one gets the stored answer. "capital of france" and "What's the capital of France?" share an entry. Each question is turned into an embedding (1,536 numbers), and the closest stored one is served if its similarity is at least the team's threshold.
+- **The danger:** embeddings measure how *related* two texts are, not whether they ask the *same thing*. Measured with `text-embedding-3-small` (O7): "Can I get a refund after 30 days?" vs "...within 30 days?" scores **0.958**, higher than any real paraphrase in our set; "Convert 10 miles to kilometers" vs the reverse scores 0.940. A wrong pair can outscore a right one, so no threshold is safe for every kind of question. It's unsafe for negation, numbers and IDs, names, personal or live data, and code; it suits FAQ-style questions with fixed answers.
+- **So it's a classifier:** it decides "same question or not", and it's evaluated like one. A wrong hit (*false positive*) answers a question nobody asked. A missed hit (*false negative*) only costs the normal price. *Precision* = how many served hits were right; *recall* = how many real repeats were caught. A higher threshold buys precision with recall.
+- **Production terms:** *semantic cache*, *embedding*, *cosine similarity*, *false positive / false negative*, *precision / recall*.
+
+### O2. Off by default, three modes, a threshold per team
+- **Per team, in `config.yaml`:** `cache.teams.<team>.semantic: off | shadow | on` and `threshold` (default 0.95). It only runs when the exact cache is on for that request too, so `x-gateway-cache: off` turns off both.
+- **`shadow`:** the lookup runs but is never served; the request still goes to the provider. Whenever the closest stored question scores **at least 0.70**, the pair (new question, matched question, score, stored answer, new answer) is saved in a list in `redis-cache` (the last 1,000 per team, kept 7 days). That's real traffic for picking the threshold, at no risk. Every team should run shadow first.
+- **Why 0.70 and not the team's threshold:** shadow mode exists to *choose* the threshold, so it has to keep pairs below the current one too, or the table can never show what a lower threshold would do. The first version only kept pairs over the threshold; with real paraphrases scoring 0.58-0.87 (O7), it would have kept almost nothing at 0.95. Caught on the first real run.
+- **Picking the threshold** is the team's call, because only the team knows what a wrong answer costs them. The gateway's job is to give them numbers: `scripts/semantic_eval.py` takes labelled pairs (hand-written, or exported from shadow mode and labelled) and prints hit rate and precision at each threshold. The team states a limit ("at most 1 wrong per 100 hits") and gets the **lowest** threshold that meets it, since anything stricter throws savings away. If no threshold gives enough hits at that precision, the answer is to leave it off.
+- **Industry:** LiteLLM and RedisVL expose a threshold you set yourself (LiteLLM's docs use 0.8); Kong has a semantic cache plugin; Portkey picks a strict threshold and doesn't let you change it; Cloudflare AI Gateway and Helicone only do exact matching. Most products ship the knob and leave measuring it to you. The golden set and shadow mode are standard practice for launching any classifier, not a gateway feature. Research goes further: vCache (ICLR 2026) learns a threshold per stored prompt to stay under an error rate the user picks.
+- **v2:** check ~1% of served hits by calling the provider anyway and having an LLM judge compare the answers, for a running wrong-hit rate per team, with automatic switch-off above the team's limit. And count "rephrased or retried with the cache off right after a hit" as a cheap signal of a wrong hit.
+- **Production terms:** *shadow mode*, *golden dataset*, *precision/recall trade-off*, *LLM-as-judge*, *kill switch*.
+
+### O3. What gets compared: only the last user message, inside an exact partition
+- **Partition:** a SHA-256 of the team, the embedding model, and the whole request except the last message (and except `stream`, `stream_options`, `user`, as in N1). Model, system prompt, temperature, tools and earlier turns all have to match **exactly**; only the last user message is compared by meaning. "Same question, different system prompt" is never a hit.
+- **Only when the last message is from the user and under 2,000 characters.** In a long prompt, one changed sentence still scores ~0.99, because the rest dominates the embedding.
+- **The threshold belongs to the embedding model.** 0.95 on one model isn't 0.95 on another, and vectors from different models can't be compared at all. The model's name is in the partition, so changing models starts an empty cache instead of comparing the wrong vectors, and the threshold has to be measured again.
+- **Exact first:** the exact cache is checked before embedding anything. An exact hit costs one Redis read; the semantic lookup costs an API call.
+
+### O4. Embeddings from OpenAI, with a short timeout and a breaker
+- **Model:** OpenAI `text-embedding-3-small`, $0.02 per 1M tokens (2026-11-17). A question is ~50 tokens, so a million lookups cost ~$1, against ~$195 for a million gpt-4o-mini calls: about 0.5% of a real call. The gateway pays it, as overhead; teams aren't billed for lookups.
+- **Rejected: a local model** (e.g. `all-MiniLM-L6-v2`). Free and ~10-20 ms, but PyTorch takes the image from ~150 MB to over 1 GB, every copy loads the model, and it matches paraphrases less well (more wrong hits at the same threshold). It's behind one `Embedder` class, so switching later is one class.
+- **The real cost is time:** we embed before knowing whether it's a hit, so every miss pays too. Waiting long for an optional step is how a slow dependency becomes a *cascading failure*: requests pile up holding connections, clients time out and retry, and the gateway looks down while the LLM is fine. So:
+  - **timeout 1 s**, just above the call's normal slowest. Slower means a miss. LiteLLM waits 5 s by default; too generous. `gateway_embedding_seconds` records the real latency.
+  - **It started at 500 ms, from a guess of "100-300 ms".** Measured from inside a gateway container on 2026-11-17: **270-455 ms**, about 350 ms typical, warm or cold. So 500 ms sat *at* the slow end of normal, and the first real run skipped about 1 lookup in 4, including the first question on each copy, which then never got stored. Raised to 1 s. Most of that time is distance to OpenAI's servers: a gateway running in the same cloud region would see far less, and its timeout should be measured there, not copied from here.
+  - **Connection reuse isn't the fix:** httpx drops idle connections after 5 s, so a quiet copy opens a new one each time, but that costs only ~50 ms here. Keeping them open longer made it worse: after 20 s idle a reused connection took 1,174 ms, probably because OpenAI had already closed its end.
+  - **a circuit breaker** (the same class as for providers): after 3 failures in a row, skip embedding for 30 s, so a dead embeddings API costs 0 ms per request, not 500 ms. A timeout bounds the damage to one request; a breaker stops you paying it again and again.
+- **Fail open, as everywhere in the cache:** embedding down, Redis down or the index missing all mean a miss.
+- **Production terms:** *cascading failure*, *timeout budget*, *circuit breaker*, *fail open*.
+
+### O5. Vectors in `redis-cache`, with Redis's own vector search
+- **Where:** the `redis-cache` we already run. Redis 8 has vector search built in (`FT.CREATE ... VECTOR`), so there's no new service, and it keeps N3's property: the cache is disposable, losing it means misses. A vector database (Qdrant, pgvector) would add a service for no gain at this size.
+- **Layout:** one hash per stored question, `sem:{partition}:{hash of the question}`, holding the partition (a TAG), the vector, the question, the answer and who answered it, with the same TTL as the exact cache. Redis drops expired hashes from the index on its own. The same question in the same partition overwrites itself.
+- **Search:** `@partition:{...}=>[KNN 1 @vector $vec]`: the closest stored question *in this partition only*, by cosine distance (similarity = 1 − distance).
+- **FLAT index (exact search), not HNSW (approximate).** With 256 MB there are at most tens of thousands of entries, and the partition filter cuts that to a handful, so a brute-force scan takes well under a millisecond. **v2:** HNSW if the cache grows to millions.
+- **The index lives in memory with no persistence,** so it's created on first use and again if a lookup finds it missing (after a `redis-cache` restart).
+- **Production terms:** *vector search*, *KNN*, *pre-filtering*, *FLAT vs HNSW (exact vs approximate nearest neighbour)*.
+
+### O6. What a semantic hit costs, and what people see
+- Same as an exact hit (N4): $0 to the team, a ledger row with `cache_hit` and `saved_micros`, one request from the rate limit and the token estimate refunded.
+- **Headers:** `x-gateway-cache: semantic-hit` and `x-gateway-cache-similarity: 0.9612`, so a bad answer can be traced to a score, and a client can refuse hits below its own bar. Shadow mode answers `miss`: the client sees nothing different.
+- **Logged** at INFO: the team, the score and the matched entry's key, never the question text (prompts can hold customer data; they stay in `redis-cache` only).
+- **Metrics:** `gateway_semantic_lookups_total{model, result}` (`hit`, `miss`, `shadow_hit`, `skipped`), `gateway_semantic_similarity` (a histogram of the best score per lookup, to see where a team's traffic sits relative to its threshold), and `gateway_embedding_seconds`.
+
+### O7. The first measurement: on hard pairs, this model can't separate them
+- **The set:** `evals/semantic_pairs.jsonl`, 40 hand-written pairs: 20 real paraphrases ("how do i reset my password" / "How can I reset my password?") and 20 near-misses written to fool an embedding (enable/disable, Austria/Australia, after/within 30 days, order 1234/5678). Run with `scripts/semantic_eval.py table evals/semantic_pairs.jsonl` on 2026-11-17, `text-embedding-3-small`.
+- **Result:** real paraphrases scored **0.58-0.87**; near-misses scored **0.43-0.96**. The ranges overlap completely:
+
+| Threshold | Served | Wrong | Precision | Recall |
+|---|---|---|---|---|
+| 0.80 | 15 | 7 | 53% | 40% |
+| 0.85 | 8 | 4 | 50% | 20% |
+| 0.90 | 2 | 2 | 0% | 0% |
+| 0.95 | 1 | 1 | 0% | 0% |
+
+- **What it means:** at 0.95 this model catches no real paraphrase and still serves one wrong answer. For questions like these, the answer is "leave it off", and the tool says so.
+- **What it doesn't mean:** the near-misses are deliberately adversarial, and they're half the set. In real traffic most stored questions are unrelated to the new one (they score far lower), and the closest match is more often a true repeat, so real precision would be higher. That's exactly what shadow mode on a team's real traffic is for, and why the threshold is never picked from a made-up table. *(An earlier version of these notes used made-up numbers where 0.95 caught 15% of traffic. The real measurement was very different.)*
+- **Where to go from here, if a team needs it:** a model trained for "same question or not" rather than "related" (a *cross-encoder* or *reranker* that reads both questions together, or an embedding model fine-tuned on question pairs), or an LLM check of each candidate hit before serving it. Both cost latency on every candidate, and both should be measured with the same script.
+- **Production terms:** *offline evaluation*, *hard negatives*, *score distribution overlap*, *cross-encoder / reranker*.
+
+### O8. Tests and the real check
+- **29 semantic tests:** what goes into the partition (everything but the question, including the team and the embedding model); which requests can't use it; a paraphrase is served and costs $0; a related question under the threshold is a miss; the threshold is the team's; shadow mode never serves and keeps pairs under the threshold too; an exact hit needs no embedding; `x-gateway-cache: off` turns off both; slow embeddings, a failing embeddings API (the breaker stops calling after 3), the vector store down and a lost index are all misses; bad config stops startup, and YAML's bare `on`/`off` work.
+- **Mutation checks:** ignoring the threshold, serving in shadow mode, leaving the request out of the partition, never telling the breaker, keeping shadow pairs only over the threshold, and treating a lost index as an outage each made a test fail.
+- **fakeredis has no vector search,** so the tests use an in-memory stand-in, and the real `RedisVectors` was checked by hand against `redis-cache`: Redis's similarity matched one computed in Python, the partition filter kept another partition's identical vector out, the TTL was set, and a dropped index was recreated.
+- **Real run** (3 copies behind nginx, real OpenAI and `redis-cache`, `temperature: 0`):
+
+| Request | Result |
+|---|---|
+| "How can I reset my password?" | miss, 5.3 s |
+| "how do i reset my password" | `semantic-hit`, similarity 0.8683, **0.40 s** (the embedding call; an exact hit is 0.035 s) |
+| "how do i reset my password?" with `stream: true` | `semantic-hit`, 0.8832, replayed as SSE |
+| "cancel my order", then "cancel my subscription" | both misses (0.739, under the 0.85 used for this test) |
+| Ledger | both hits cost 0 and recorded `saved_micros = 165` |
+| Shadow mode, "refund after 30 days" after "...within 30 days" | saved as a pair at **0.9576**: over 0.95, so `on` would have served a wrong answer |
+
+- **What the real run caught, that the tests didn't:**
+  - shadow mode kept only pairs over the threshold, which makes it useless for choosing one (fixed, O2);
+  - the 500 ms timeout was a guess and sat inside normal latency, skipping 1 lookup in 4 (raised to 1 s, O4);
+  - `FLUSHALL` deletes search indexes too, and the gateway treated the missing index as Redis being down for 5 s (now a miss that recreates it, O5).

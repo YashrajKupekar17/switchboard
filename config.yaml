@@ -88,7 +88,13 @@ budgets:
 # Exact response cache (DECISIONS.md N). Off unless a team turns it on: a cached answer to a creative
 # prompt would stop that team ever getting a new one. Per request, the x-gateway-cache: on|off header
 # overrides this, and x-gateway-cache-ttl: <seconds> sets how long the answer is kept.
+#
+# semantic (DECISIONS.md O): also serve a stored answer to a question that means the same.
+#   off    = exact matches only (the default)
+#   shadow = look for a match but never serve it; save would-be hits for scripts/semantic_eval.py
+#   on     = serve matches with similarity >= threshold. Measure the threshold first: it depends on the
+#            team's questions and on the embedding model (O7).
 cache:
-  default: {enabled: false, ttl: 3600}
+  default: {enabled: false, ttl: 3600, semantic: "off", threshold: 0.95}
   teams:
-    search: {enabled: true}
+    search: {enabled: true, semantic: shadow}

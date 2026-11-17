@@ -14,7 +14,7 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import redis.asyncio as redis
@@ -32,6 +32,8 @@ REDIS_RETRY_AFTER = 5.0
 class CacheSettings:
     enabled: bool
     ttl: int  # seconds
+    semantic: str = "off"  # "off" | "shadow" | "on" (DECISIONS.md O2); only runs when enabled is true
+    threshold: float = 0.95  # lowest similarity served as a semantic hit
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ def settings_from(default: CacheSettings, header: Optional[str], ttl_header: Opt
     ttl = default.ttl
     if ttl_header and ttl_header.isdigit():
         ttl = min(max(1, int(ttl_header)), MAX_TTL)
-    return CacheSettings(enabled, ttl)
+    return replace(default, enabled=enabled, ttl=ttl)
 
 
 class ResponseCache:

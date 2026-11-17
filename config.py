@@ -8,6 +8,7 @@ from budgets import Budget
 from cache import MAX_TTL, CacheSettings
 from pricing import Price
 from ratelimit import Limits
+from semantic import MODES as SEMANTIC_MODES
 
 PROVIDER_TYPES = ("openai", "anthropic")  # "openai" = anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM...)
 ANTHROPIC_VERSION = "2026-10-21"
@@ -66,6 +67,14 @@ class Config:
         return self.team_cache.get(team, self.default_cache)
 
 
+def _yaml_modes(cache: dict) -> dict:
+    # YAML reads a bare `on` as true and `off` as false, so `semantic: on` arrives as True.
+    semantic = cache.get("semantic")
+    if isinstance(semantic, bool):
+        return {**cache, "semantic": "on" if semantic else "off"}
+    return cache
+
+
 def load_config(path: str) -> Config:
     with open(path) as f:
         raw = yaml.safe_load(f)
@@ -105,11 +114,18 @@ def load_config(path: str) -> Config:
             raise RuntimeError(f"budget for {team!r}: max_usd must be at least soft_usd")
 
     c = raw.get("cache", {})
-    default_cache = {"enabled": False, "ttl": 3600, **(c.get("default") or {})}  # off unless a team asks (N1)
-    team_cache = {team: CacheSettings(**{**default_cache, **v}) for team, v in (c.get("teams") or {}).items()}
+    default_cache = _yaml_modes({"enabled": False, "ttl": 3600, **(c.get("default") or {})})  # off unless a team asks (N1)
+    team_cache = {team: CacheSettings(**_yaml_modes({**default_cache, **v})) for team, v in (c.get("teams") or {}).items()}
     for team, settings in [("default", CacheSettings(**default_cache)), *team_cache.items()]:
         if not 1 <= settings.ttl <= MAX_TTL:
             raise RuntimeError(f"cache for {team!r}: ttl must be between 1 and {MAX_TTL} seconds")
+        if settings.semantic not in SEMANTIC_MODES:
+            raise RuntimeError(f"cache for {team!r}: semantic must be one of {SEMANTIC_MODES}")
+        if not 0 < settings.threshold <= 1:
+            raise RuntimeError(f"cache for {team!r}: threshold must be above 0 and at most 1")
+        if settings.semantic != "off" and "openai" not in providers:
+            # Questions are embedded with OpenAI's API (DECISIONS.md O4), so it needs the openai provider's key.
+            raise RuntimeError(f"cache for {team!r}: the semantic cache needs the 'openai' provider configured")
 
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})
