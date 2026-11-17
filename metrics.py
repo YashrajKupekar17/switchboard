@@ -53,7 +53,7 @@ CACHE_SAVED = Counter("gateway_cache_saved_usd_total", "What cache hits would ha
 
 # --- semantic cache (DECISIONS.md O) ---
 SEMANTIC_LOOKUPS = Counter(
-    "gateway_semantic_lookups_total", "Semantic cache lookups: hit, miss, shadow_hit, or skipped (embedding failed)",
+    "gateway_semantic_lookups_total", "Semantic cache lookups: hit, rejected (the judge said no), miss, shadow_hit, skipped (a call failed)",
     ["model", "result"],
 )
 # Where a team's best matches sit relative to its threshold: most traffic just under it means it's worth measuring again.
@@ -61,9 +61,10 @@ SEMANTIC_SIMILARITY = Histogram(
     "gateway_semantic_similarity", "Similarity of the closest stored question, per lookup", ["team"],
     buckets=(0.5, 0.7, 0.8, 0.85, 0.9, 0.92, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.0),
 )
-EMBEDDING_SECONDS = Histogram(
-    "gateway_embedding_seconds", "Time to embed a question (what every lookup pays, hit or miss)",
-    buckets=(0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 1),
+# embed: what every lookup pays, hit or miss. judge: what every candidate over the threshold pays.
+SEMANTIC_STEP_SECONDS = Histogram(
+    "gateway_semantic_step_seconds", "Time of each OpenAI call the semantic cache makes", ["step"],
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2),
 )
 
 # --- cost / usage ---

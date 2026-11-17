@@ -81,6 +81,7 @@ def open_semantic(http: httpx.AsyncClient, cache_redis: redis.Redis) -> Optional
     if openai is None:
         return None
     return semantic.SemanticCache(semantic.Embedder(http, openai.base_url, openai.api_key),
+                                  semantic.Judge(http, openai.base_url, openai.api_key),
                                   semantic.RedisVectors(cache_redis))
 
 
@@ -228,15 +229,19 @@ async def chat_completions(
         vector, match = await app.state.semantic.find(lookup)
         if match:
             SEMANTIC_SIMILARITY.labels(caller.team).observe(match.similarity)
-        close_enough = match is not None and match.similarity >= caching.threshold
-        result = "skipped" if vector is None else "miss" if not close_enough else (
-            "hit" if caching.semantic == "on" else "shadow_hit")
+        candidate = match is not None and match.similarity >= caching.threshold
+        result = "skipped" if vector is None else "shadow_hit" if candidate else "miss"
+        if candidate and caching.semantic == "on":
+            # The embedding only found a candidate; the judge decides (O10). Shadow mode judges after the answer is sent.
+            judged = await app.state.semantic.judge.same(lookup.question, match.question)
+            result = "skipped" if judged is None else "hit" if judged >= semantic.JUDGE_MIN_YES else "rejected"
         SEMANTIC_LOOKUPS.labels(request.model, result).inc()
         if result == "hit":
-            log.info("semantic hit team=%s similarity=%.4f entry=%s", caller.team, match.similarity, match.key)
+            log.info("semantic hit team=%s similarity=%.4f judge=%.2f entry=%s",
+                     caller.team, match.similarity, judged, match.key)
             return _serve_hit(caller, request, match.hit, estimate, wants_usage, {
                 **hit_headers, "x-gateway-cache": "semantic-hit",
-                "x-gateway-cache-similarity": f"{match.similarity:.4f}"})
+                "x-gateway-cache-similarity": f"{match.similarity:.4f}", "x-gateway-cache-judge": f"{judged:.2f}"})
         if caching.semantic == "shadow" and match and match.similarity >= semantic.SHADOW_FLOOR:
             shadow = match  # keep the pair once the real answer is in, even under the threshold: it's for picking one (O2)
 
@@ -248,7 +253,7 @@ async def chat_completions(
             if vector:
                 _spawn(app.state.semantic.put(lookup, vector, body, target.deployment, caching.ttl))
             if shadow:
-                _spawn(app.state.semantic.save_shadow(caller.team, _shadow_record(request.model, lookup, shadow, body)))
+                _spawn(_save_shadow(caller.team, request.model, lookup, shadow, body))
 
     if request.stream:
         # Providers only send token usage at the end of a stream if asked to; we need it for cost tracking.
@@ -322,13 +327,16 @@ def _answer_text(body: dict) -> Optional[str]:
     return (choices[0].get("message") or {}).get("content")
 
 
-def _shadow_record(model: str, lookup: semantic.Lookup, match: semantic.Match, body: dict) -> dict:
-    # One would-be hit, for labelling later: was the stored answer right for the new question? (scripts/semantic_eval.py)
-    return {
+async def _save_shadow(team: str, model: str, lookup: semantic.Lookup, match: semantic.Match, body: dict) -> None:
+    # One candidate pair, for labelling later (scripts/semantic_eval.py). Runs after the answer is sent, so the
+    # judge's ~660 ms never slows a request in shadow mode. Its verdict is saved next to the pair, for checking it.
+    judged = await app.state.semantic.judge.same(lookup.question, match.question)
+    await app.state.semantic.save_shadow(team, {
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "model": model,
-        "similarity": round(match.similarity, 4), "question": lookup.question, "matched_question": match.question,
+        "similarity": round(match.similarity, 4), "judge": None if judged is None else round(judged, 4),
+        "question": lookup.question, "matched_question": match.question,
         "cached_answer": _answer_text(match.hit.body), "fresh_answer": _answer_text(body), "same": None,
-    }
+    })
 
 
 async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int) -> None:

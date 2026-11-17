@@ -634,7 +634,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **Production terms:** *semantic cache*, *embedding*, *cosine similarity*, *false positive / false negative*, *precision / recall*.
 
 ### O2. Off by default, three modes, a threshold per team
-- **Per team, in `config.yaml`:** `cache.teams.<team>.semantic: off | shadow | on` and `threshold` (default 0.95). It only runs when the exact cache is on for that request too, so `x-gateway-cache: off` turns off both.
+- **Per team, in `config.yaml`:** `cache.teams.<team>.semantic: off | shadow | on` and `threshold`. *(Since O10: `on` always means the judge decides, and `threshold` is where a match becomes a candidate for it, default 0.70.)* It only runs when the exact cache is on for that request too, so `x-gateway-cache: off` turns off both.
 - **`shadow`:** the lookup runs but is never served; the request still goes to the provider. Whenever the closest stored question scores **at least 0.70**, the pair (new question, matched question, score, stored answer, new answer) is saved in a list in `redis-cache` (the last 1,000 per team, kept 7 days). That's real traffic for picking the threshold, at no risk. Every team should run shadow first.
 - **Why 0.70 and not the team's threshold:** shadow mode exists to *choose* the threshold, so it has to keep pairs below the current one too, or the table can never show what a lower threshold would do. The first version only kept pairs over the threshold; with real paraphrases scoring 0.58-0.87 (O7), it would have kept almost nothing at 0.95. Caught on the first real run.
 - **Picking the threshold** is the team's call, because only the team knows what a wrong answer costs them. The gateway's job is to give them numbers: `scripts/semantic_eval.py` takes labelled pairs (hand-written, or exported from shadow mode and labelled) and prints hit rate and precision at each threshold. The team states a limit ("at most 1 wrong per 100 hits") and gets the **lowest** threshold that meets it, since anything stricter throws savings away. If no threshold gives enough hits at that precision, the answer is to leave it off.
@@ -652,7 +652,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **Model:** OpenAI `text-embedding-3-small`, $0.02 per 1M tokens (2026-11-17). A question is ~50 tokens, so a million lookups cost ~$1, against ~$195 for a million gpt-4o-mini calls: about 0.5% of a real call. The gateway pays it, as overhead; teams aren't billed for lookups.
 - **Rejected: a local model** (e.g. `all-MiniLM-L6-v2`). Free and ~10-20 ms, but PyTorch takes the image from ~150 MB to over 1 GB, every copy loads the model, and it matches paraphrases less well (more wrong hits at the same threshold). It's behind one `Embedder` class, so switching later is one class.
 - **The real cost is time:** we embed before knowing whether it's a hit, so every miss pays too. Waiting long for an optional step is how a slow dependency becomes a *cascading failure*: requests pile up holding connections, clients time out and retry, and the gateway looks down while the LLM is fine. So:
-  - **timeout 1 s**, just above the call's normal slowest. Slower means a miss. LiteLLM waits 5 s by default; too generous. `gateway_embedding_seconds` records the real latency.
+  - **timeout 1 s**, just above the call's normal slowest. Slower means a miss. LiteLLM waits 5 s by default; too generous. `gateway_semantic_step_seconds{step="embed"}` records the real latency.
   - **It started at 500 ms, from a guess of "100-300 ms".** Measured from inside a gateway container on 2026-11-17: **270-455 ms**, about 350 ms typical, warm or cold. So 500 ms sat *at* the slow end of normal, and the first real run skipped about 1 lookup in 4, including the first question on each copy, which then never got stored. Raised to 1 s. Most of that time is distance to OpenAI's servers: a gateway running in the same cloud region would see far less, and its timeout should be measured there, not copied from here.
   - **Connection reuse isn't the fix:** httpx drops idle connections after 5 s, so a quiet copy opens a new one each time, but that costs only ~50 ms here. Keeping them open longer made it worse: after 20 s idle a reused connection took 1,174 ms, probably because OpenAI had already closed its end.
   - **a circuit breaker** (the same class as for providers): after 3 failures in a row, skip embedding for 30 s, so a dead embeddings API costs 0 ms per request, not 500 ms. A timeout bounds the damage to one request; a breaker stops you paying it again and again.
@@ -669,9 +669,9 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 
 ### O6. What a semantic hit costs, and what people see
 - Same as an exact hit (N4): $0 to the team, a ledger row with `cache_hit` and `saved_micros`, one request from the rate limit and the token estimate refunded.
-- **Headers:** `x-gateway-cache: semantic-hit` and `x-gateway-cache-similarity: 0.9612`, so a bad answer can be traced to a score, and a client can refuse hits below its own bar. Shadow mode answers `miss`: the client sees nothing different.
+- **Headers:** `x-gateway-cache: semantic-hit`, `x-gateway-cache-similarity: 0.9612` and (since O10) `x-gateway-cache-judge: 1.00`, so a bad answer can be traced to a score, and a client can refuse hits below its own bar. Shadow mode answers `miss`: the client sees nothing different.
 - **Logged** at INFO: the team, the score and the matched entry's key, never the question text (prompts can hold customer data; they stay in `redis-cache` only).
-- **Metrics:** `gateway_semantic_lookups_total{model, result}` (`hit`, `miss`, `shadow_hit`, `skipped`), `gateway_semantic_similarity` (a histogram of the best score per lookup, to see where a team's traffic sits relative to its threshold), and `gateway_embedding_seconds`.
+- **Metrics:** `gateway_semantic_lookups_total{model, result}` (`hit`, `rejected` by the judge, `miss`, `shadow_hit`, `skipped` when a call failed), `gateway_semantic_similarity` (a histogram of the best score per lookup, to see where a team's traffic sits relative to its threshold), and `gateway_semantic_step_seconds{step}` (`embed` and `judge`).
 
 ### O7. The first measurement: on hard pairs, this model can't separate them
 - **The set:** `evals/semantic_pairs.jsonl`, 40 hand-written pairs: 20 real paraphrases ("how do i reset my password" / "How can I reset my password?") and 20 near-misses written to fool an embedding (enable/disable, Austria/Australia, after/within 30 days, order 1234/5678). Run with `scripts/semantic_eval.py table evals/semantic_pairs.jsonl` on 2026-11-17, `text-embedding-3-small`.
@@ -708,3 +708,42 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   - shadow mode kept only pairs over the threshold, which makes it useless for choosing one (fixed, O2);
   - the 500 ms timeout was a guess and sat inside normal latency, skipping 1 lookup in 4 (raised to 1 s, O4);
   - `FLUSHALL` deletes search indexes too, and the gateway treated the missing index as Redis being down for 5 s (now a miss that recreates it, O5).
+
+### O9. Experiment: find with the embedding, check with a second model
+- **Question:** the embedding can't separate same from different questions (O7). Does a second model that reads *both* questions together do better? Same 40 pairs, 2026-11-17.
+
+| Checker | Precision | Recall | Time per check | Served wrong answers |
+|---|---|---|---|---|
+| Embedding alone, best threshold (0.80) | 53% | 40% | (the lookup) | 7 |
+| Cross-encoder `cross-encoder/quora-distilroberta-base`, ≥ 0.5 | 78% | 35% | **12 ms** on a laptop CPU | refund after/within 30 days (0.92), miles/km (0.97) |
+| gpt-4o-mini judge, neutral prompt, P(yes) ≥ 0.5 | **100%** | **90%** | **~660 ms** median, 3.5 s worst | none |
+| Same, only for pairs with embedding ≥ 0.6 | 100% | 85% | same, only in the grey zone | none |
+
+- **The cross-encoder** is fast but was trained on Quora's questions, not ours: it was strict about wording ("Can I pay with PayPal?" vs "Do you accept PayPal?": 0.001) and still passed the two worst traps. An off-the-shelf "same question" model doesn't transfer automatically; it would need fine-tuning on the team's labelled pairs, which is what shadow mode collects.
+- **The LLM judge** reads both questions and understands them, so "after" vs "within" and "miles to km" vs "km to miles" were easy. The prompt: *"Are these the same question, so that the same answer would be correct for both? Reply with only yes or no."*, one output token, with the probability of "yes" read from `logprobs`.
+- **Overfitting check:** a first prompt listed the traps ("different numbers, places, dates, or opposite actions mean no"). That's tuning on the test set. The neutral prompt did as well or better (100% / 90% vs 95% / 95%), so the result isn't the hints.
+- **What it costs:** money is small (~80 input tokens, 1 output: about 6% of a typical gpt-4o-mini call). Time isn't: embedding (~350 ms) plus judge (~660 ms) is about 1 s. A judged hit still beats a 3-5 s answer, but a judged *miss* is 1 s slower than no cache at all. Running the judge only in the grey zone keeps that to requests that have a candidate at all.
+- **Limits:** 40 pairs, written by hand, short and clean. Real questions are messier. It's a direction, not a result: the next step would be the judge in shadow mode on real traffic, labelled, before serving anything it approves.
+- **Production terms:** *two-stage retrieval (retrieve, then rerank/verify)*, *cross-encoder vs bi-encoder*, *LLM-as-judge*, *domain shift*, *overfitting to the test set*.
+
+### O10. The judge decides; the embedding only finds a candidate
+- **Decision:** `semantic: on` means: the embedding finds the closest stored question; if its similarity is at least the team's `threshold` (default **0.70**), gpt-4o-mini reads both questions and the stored answer is served only if P("yes, the same question") is at least **0.9**. There's no "serve on the score alone" zone: wrong pairs scored up to 0.958 (O7), so no score is high enough.
+- **Rejected: a separate `verify: judge | off` setting.** It would have kept "serve on the embedding score alone" as an option, and O7 showed that's unsafe. One fewer setting, and one unsafe mode gone.
+- **Who pays the judge's time:** only candidates. Unrelated questions are a plain miss with no judge call. A candidate the judge approves saves ~2-4 s (a 3-5 s answer becomes ~1 s); one it rejects costs ~1.2 s extra (embedding + judge). So it pays off in time if roughly **1 in 4 candidates** is approved, and in money if more than ~6% are (a judge call costs ~6% of a gpt-4o-mini call). Approval rate = `hit / (hit + rejected)` from the existing lookup counter, per team. Below ~25%, turn it off for that team.
+- **The threshold's new job:** it no longer decides what's served; it decides who pays for a judge call. Lower catches more repeats and pays for more rejected candidates. On the test pairs (judge P(yes) ≥ 0.9): 0.60 → 100% precision, 85% recall; 0.70 → 100% / 65%. The default 0.70 is the cautious end; a team lowers it once its approval rate shows the judge is paying off.
+- **Shadow mode** runs the judge *after* the answer has been sent and saves its verdict with the pair, so shadow never slows a request, and labelling the pairs also checks the judge. `semantic_eval.py table --judge` prints precision and recall for "embedding + judge", the thing the gateway actually serves.
+- **Failure:** the judge has the same safety rules as the embedding (O4), with its own breaker: a 1.5 s timeout (measured ~660-700 ms typical, 3.5 s worst), and any failure is a miss.
+- **Built as:** `OpenAIStep` (timeout, breaker, metric, None on failure), with `Embedder` and `Judge` as two short subclasses.
+- **v2:** hide the judge's time on misses by starting the real LLM call at the same time and cancelling it if the judge says yes. It costs part of a cancelled call on every hit and makes the request path harder to follow, so only if the approval rate shows the wait is a real problem.
+- **Real run** (3 copies, real OpenAI, `on`, threshold 0.70):
+
+| Request | Similarity | Judge | Result |
+|---|---|---|---|
+| "how do i reset my password" after "How can I reset my password?" | 0.868 | 1.00 | `semantic-hit`, 1.04 s (miss was 4.3 s) |
+| "When are you open?" after "What are your opening hours?" | 0.789 | 1.00 | `semantic-hit`, 1.30 s. The embedding alone could never have trusted 0.789. |
+| "refund after 30 days" after "...within 30 days" | 0.958 | no | miss: `rejected` |
+| "cancel my subscription" after "cancel my order" | 0.739 | no | miss: `rejected` |
+
+  Metrics: 4 judge calls, 2 approved, 2 rejected; judge 0.70 s and embedding 0.46 s on average. In shadow mode the same pairs were saved with verdicts 1.0 and 0, and nothing was served.
+- **Tests:** 31 semantic tests. Mutation checks: ignoring the judge's "no", never asking it, ignoring the threshold, and adding "yes" and "no" probabilities together each made tests fail.
+- **Production terms:** *two-stage retrieval*, *verifier*, *LLM-as-judge*, *logprobs as confidence*, *break-even analysis*.

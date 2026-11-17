@@ -3,19 +3,24 @@
 Runs after the exact cache misses, only for teams that turned it on (or to shadow mode, which looks but never serves):
 
     request -> partition (exact hash of everything except the last user message) + question (that message)
-            -> embed the question (OpenAI, 500 ms timeout, circuit breaker)
+            -> embed the question (OpenAI, 1 s timeout, circuit breaker)
             -> closest stored question in the same partition (Redis vector search)
-            -> similarity >= the team's threshold ? hit : miss
+            -> similarity >= the team's threshold ? ask the judge : miss
+            -> the judge (gpt-4o-mini) reads both questions: the same question ? hit : miss
+
+The embedding only finds a candidate. It can't decide: on our test pairs, different questions scored higher than
+real paraphrases (O7). The judge reads both questions together and decides (O9, O10).
 
 Every failure on the way is a miss. The cache is there to save money; it must never be why a request fails or slows down.
 """
 import hashlib
 import json
 import logging
+import math
 import struct
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import httpx
 import redis.asyncio as redis
@@ -23,7 +28,7 @@ from redis.exceptions import RedisError, ResponseError
 
 from breaker import CircuitBreaker
 from cache import NOT_IN_KEY, Hit
-from metrics import EMBEDDING_SECONDS
+from metrics import SEMANTIC_STEP_SECONDS
 
 log = logging.getLogger("gateway")
 
@@ -31,6 +36,14 @@ MODES = ("off", "shadow", "on")
 EMBED_MODEL = "text-embedding-3-small"
 DIMENSIONS = 1536
 EMBED_TIMEOUT = 1.0  # just above the call's normal slowest, measured (O4): slower counts as a miss
+JUDGE_MODEL = "gpt-4o-mini"
+JUDGE_TIMEOUT = 1.5  # measured ~660 ms typical, 3.5 s worst (O9)
+JUDGE_MIN_YES = 0.9  # probability of "yes" needed to serve: a miss costs money, a wrong hit costs trust
+# Neutral on purpose: a prompt that lists the traps scores well on the test set and nowhere else (O9).
+JUDGE_PROMPT = ("Two users sent these questions to an assistant.\n"
+                "Question A: {a}\nQuestion B: {b}\n\n"
+                "Are these the same question, so that the same answer would be correct for both? "
+                "Reply with only yes or no.")
 MAX_QUESTION_CHARS = 2000  # in a longer prompt, one changed sentence still scores ~0.99 (O3)
 INDEX = "semantic"
 PREFIX = "sem:"  # every hash under this prefix is in the index
@@ -71,41 +84,71 @@ def lookup_for(team: str, payload: dict) -> Optional[Lookup]:
     return Lookup(hashlib.sha256(canonical.encode()).hexdigest(), question)
 
 
-class Embedder:
-    """Question -> vector, via OpenAI's embeddings API. None means "couldn't, treat it as a miss"."""
+class OpenAIStep:
+    """One OpenAI call on the way to a cache decision: a short timeout, its own breaker, None on any failure (O4)."""
 
-    def __init__(self, http: httpx.AsyncClient, base_url: str, api_key: str, breaker: Optional[CircuitBreaker] = None):
+    def __init__(self, http: httpx.AsyncClient, base_url: str, api_key: str, path: str, step: str, model: str,
+                 timeout: float):
         self.http = http
-        self.url = f"{base_url.rstrip('/')}/embeddings"
+        self.url = f"{base_url.rstrip('/')}/{path}"
         self.api_key = api_key
+        self.step = step
+        self.timeout = timeout
         # The same breaker as for providers: once the API is failing, stop paying the timeout on every request.
-        self.breaker = breaker or CircuitBreaker(f"embeddings/{EMBED_MODEL}", failure_threshold=3)
+        self.breaker = CircuitBreaker(f"{step}/{model}", failure_threshold=3)
 
-    async def embed(self, text: str) -> Optional[List[float]]:
+    async def _post(self, body: dict, parse: Callable[[dict], object]):
         permit = self.breaker.allow()
         if permit is None:
             return None
         outcome = None
         start = time.monotonic()
         try:
-            response = await self.http.post(
-                self.url, json={"model": EMBED_MODEL, "input": text},
-                headers={"Authorization": f"Bearer {self.api_key}"}, timeout=EMBED_TIMEOUT,
-            )
+            response = await self.http.post(self.url, json=body, headers={"Authorization": f"Bearer {self.api_key}"},
+                                            timeout=self.timeout)
             response.raise_for_status()
-            vector = response.json()["data"][0]["embedding"]
+            result = parse(response.json())
             outcome = "ok"
         except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
             outcome = "failed"
             self.breaker.record_failure(permit)
-            log.warning("embedding failed (%r): semantic lookup skipped, request continues as a miss", exc)
+            log.warning("semantic %s failed (%r): request continues as a miss", self.step, exc)
             return None
         finally:
             if outcome is None:  # cancelled mid-call: says nothing about the API's health
                 self.breaker.release(permit)
-        EMBEDDING_SECONDS.observe(time.monotonic() - start)
+        SEMANTIC_STEP_SECONDS.labels(self.step).observe(time.monotonic() - start)
         self.breaker.record_success(permit)
-        return vector
+        return result
+
+
+class Embedder(OpenAIStep):
+    """Question -> vector, via OpenAI's embeddings API."""
+
+    def __init__(self, http: httpx.AsyncClient, base_url: str, api_key: str):
+        super().__init__(http, base_url, api_key, "embeddings", "embed", EMBED_MODEL, EMBED_TIMEOUT)
+
+    async def embed(self, text: str) -> Optional[List[float]]:
+        return await self._post({"model": EMBED_MODEL, "input": text}, lambda d: d["data"][0]["embedding"])
+
+
+class Judge(OpenAIStep):
+    """Two questions -> the probability that they're the same question, from an LLM reading both (O10)."""
+
+    def __init__(self, http: httpx.AsyncClient, base_url: str, api_key: str):
+        super().__init__(http, base_url, api_key, "chat/completions", "judge", JUDGE_MODEL, JUDGE_TIMEOUT)
+
+    async def same(self, a: str, b: str) -> Optional[float]:
+        # One output token, and logprobs to read how sure it is instead of a bare yes or no.
+        return await self._post({
+            "model": JUDGE_MODEL, "temperature": 0, "max_tokens": 1, "logprobs": True, "top_logprobs": 5,
+            "messages": [{"role": "user", "content": JUDGE_PROMPT.format(a=a, b=b)}],
+        }, _probability_of_yes)
+
+
+def _probability_of_yes(response: dict) -> float:
+    top = response["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+    return sum(math.exp(t["logprob"]) for t in top if t["token"].strip().lower() == "yes")
 
 
 def _pack(vector: List[float]) -> bytes:
@@ -184,8 +227,9 @@ class RedisVectors:
 
 
 class SemanticCache:
-    def __init__(self, embedder: Embedder, vectors: RedisVectors):
+    def __init__(self, embedder: Embedder, judge: Judge, vectors: RedisVectors):
         self.embedder = embedder
+        self.judge = judge
         self.vectors = vectors
         self.down_until = 0.0
 

@@ -33,7 +33,7 @@ class CacheSettings:
     enabled: bool
     ttl: int  # seconds
     semantic: str = "off"  # "off" | "shadow" | "on" (DECISIONS.md O2); only runs when enabled is true
-    threshold: float = 0.95  # lowest similarity served as a semantic hit
+    threshold: float = 0.70  # lowest similarity that becomes a candidate for the judge (DECISIONS.md O10)
 
 
 @dataclass(frozen=True)

@@ -66,7 +66,7 @@ Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven
 
 **Response cache.** A team can turn on caching, by default in `config.yaml` or per request with `x-gateway-cache: on`. An identical request from the same team then gets the stored answer from Redis, at no cost and in a few milliseconds instead of a second or two. It's off unless asked for, because a cached answer to "write a poem" would stop a team ever getting a new one. Only complete answers from the first-choice model are stored: not errors, cut-off answers, refusals, or answers from a fallback provider. Teams never share entries. Cached answers live in their own Redis, which evicts the least-used answers when it's full, so they can never push out rate-limit data. Each hit records what it would have cost, so the savings show on the cost dashboard.
 
-**Semantic cache.** A team can also let a question that *means* the same as a stored one get the stored answer ("how do i reset my password" for "How can I reset my password?"). Questions are compared as OpenAI embeddings, only when everything else in the request (model, system prompt, settings, earlier messages) matches exactly. It's risky: on 40 hand-written pairs, real paraphrases scored 0.58-0.87 while near-misses like "refund *after* 30 days" vs "*within* 30 days" scored up to 0.96, so no threshold separated them. So it's off by default, and has a shadow mode that finds matches without serving them and saves the pairs, so a team can measure its own threshold with `scripts/semantic_eval.py` before turning it on. If the embedding call is slow or fails, the request is just a miss.
+**Semantic cache.** A team can also let a question that *means* the same as a stored one get the stored answer ("When are you open?" for "What are your opening hours?"). An embedding finds the closest stored question, but it doesn't decide: on 40 hand-written pairs, real paraphrases scored 0.58-0.87 while near-misses like "refund *after* 30 days" vs "*within* 30 days" scored up to 0.96, so no similarity threshold is safe. Instead, gpt-4o-mini reads both questions and decides, which gave no wrong answers on the same pairs. That costs about 0.7 s on candidates only, so it's off by default, and has a shadow mode that runs everything without serving it and saves the pairs and verdicts, so a team can measure it on its own traffic with `scripts/semantic_eval.py` before turning it on. If any step is slow or fails, the request is just a miss.
 
 **Fallback and retries.** The rule is to fall back only when the problem is the provider's, never the client's:
 
@@ -127,7 +127,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 1: streaming (SSE), TTFT, usage tracking
 - [x] Phase 2: config routing, fallback, retries, circuit breaker, metrics
 - [x] Phase 3: per-team API keys, rate limits, budgets, and everything running in Docker
-- [x] Phase 4: exact caching, semantic caching with shadow mode and an evaluation script
+- [x] Phase 4: exact caching, semantic caching (embedding + LLM judge) with shadow mode and an evaluation script
 - [ ] Phase 5: cascade routing (try a cheap model first, escalate when needed)
 - [ ] Phase 6: mock provider, load tests with Locust, published numbers
 

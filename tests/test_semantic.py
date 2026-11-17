@@ -58,6 +58,40 @@ def _cosine(a, b):
     return sum(x * y for x, y in zip(a, b)) / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
 
 
+# What the fake judge answers: the probability of "yes, the same question", per pair.
+JUDGE_SAYS = {
+    frozenset({"What's the capital of France?", "capital of france"}): 0.99,
+    frozenset({"How do I cancel my order?", "How do I cancel my subscription?"}): 0.01,
+}
+
+
+class FakeOpenAI:
+    """Chat completions and the judge share one URL: tell them apart by the logprobs only the judge asks for."""
+
+    def __init__(self, judge_fails=False):
+        self.chat = self.judged = 0
+        self.judge_fails = judge_fails
+
+    def __call__(self, request):
+        body = json.loads(request.content)
+        if not body.get("logprobs"):
+            self.chat += 1
+            return httpx.Response(200, json=FAKE_COMPLETION)
+        self.judged += 1
+        if self.judge_fails:
+            raise httpx.ReadTimeout("the judge took longer than 1.5 s")
+        prompt = body["messages"][0]["content"]
+        p = next(v for pair, v in JUDGE_SAYS.items() if all(q in prompt for q in pair))
+        return httpx.Response(200, json={"choices": [{"logprobs": {"content": [{"top_logprobs": [
+            {"token": "yes", "logprob": math.log(p)}, {"token": "no", "logprob": math.log(1 - p)}]}]}}]})
+
+
+def mock_openai(**kw):
+    fake = FakeOpenAI(**kw)
+    respx.post(OPENAI_URL).mock(side_effect=fake)
+    return fake
+
+
 def fake_embeddings(request):
     text = json.loads(request.content)["input"]
     return httpx.Response(200, json={"data": [{"embedding": VECTORS[text]}]})
@@ -70,7 +104,7 @@ def vectors(client):
     return fake
 
 
-def turn_on(monkeypatch, mode="on", threshold=0.95):
+def turn_on(monkeypatch, mode="on", threshold=0.70):
     monkeypatch.setitem(main.CONFIG.team_cache, "test-team",
                         CacheSettings(enabled=True, ttl=600, semantic=mode, threshold=threshold))
 
@@ -120,16 +154,18 @@ def test_requests_that_cannot_use_it(messages):
 def test_a_paraphrase_is_served_from_the_cache(client, vectors, monkeypatch, ledger):
     turn_on(monkeypatch)
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    chat = respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    openai = mock_openai()
 
     first = post(client, ask("What's the capital of France?"), headers={})
     wait_for(lambda: vectors.entries)
     second = post(client, ask("capital of france"), headers={})
 
-    assert chat.call_count == 1
+    assert openai.chat == 1
     assert first.headers["x-gateway-cache"] == "miss"
     assert second.headers["x-gateway-cache"] == "semantic-hit"
     assert second.headers["x-gateway-cache-similarity"] == "0.9800"
+    assert second.headers["x-gateway-cache-judge"] == "0.99"
+    assert openai.judged == 1
     assert second.json() == first.json()
     buffer = main.app.state.budgets.buffer
     wait_for(lambda: len(buffer) == 2)
@@ -138,36 +174,54 @@ def test_a_paraphrase_is_served_from_the_cache(client, vectors, monkeypatch, led
 
 
 @respx.mock
-def test_a_related_but_different_question_is_a_miss(client, vectors, monkeypatch):
-    turn_on(monkeypatch, threshold=0.95)
+def test_the_judge_rejects_a_related_but_different_question(client, vectors, monkeypatch):
+    # 0.93 is over the threshold, so it's a candidate. The embedding can't tell; the judge reads both and says no.
+    turn_on(monkeypatch)
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    chat = respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    openai = mock_openai()
 
     post(client, ask("How do I cancel my order?"), headers={})
     wait_for(lambda: vectors.entries)
     resp = post(client, ask("How do I cancel my subscription?"), headers={})
 
-    assert resp.headers["x-gateway-cache"] == "miss"  # 0.93 is under the threshold
-    assert chat.call_count == 2
+    assert resp.headers["x-gateway-cache"] == "miss"
+    assert openai.judged == 1 and openai.chat == 2
 
 
 @respx.mock
-def test_the_threshold_is_the_teams_choice(client, vectors, monkeypatch):
-    turn_on(monkeypatch, threshold=0.9)  # a team that accepts looser matches gets this one as a hit: its call
+def test_under_the_threshold_the_judge_is_not_asked(client, vectors, monkeypatch):
+    # The threshold decides who pays for a judge call: below it, a plain miss with no extra wait.
+    turn_on(monkeypatch, threshold=0.95)
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    openai = mock_openai()
 
     post(client, ask("How do I cancel my order?"), headers={})
     wait_for(lambda: vectors.entries)
+    resp = post(client, ask("How do I cancel my subscription?"), headers={})
 
-    assert post(client, ask("How do I cancel my subscription?"), headers={}).headers["x-gateway-cache"] == "semantic-hit"
+    assert resp.headers["x-gateway-cache"] == "miss"
+    assert openai.judged == 0
+
+
+@respx.mock
+def test_a_failing_judge_is_a_miss(client, vectors, monkeypatch):
+    turn_on(monkeypatch)
+    respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
+    openai = mock_openai(judge_fails=True)
+
+    post(client, ask("What's the capital of France?"), headers={})
+    wait_for(lambda: vectors.entries)
+    resp = post(client, ask("capital of france"), headers={})
+
+    assert resp.status_code == 200 and resp.headers["x-gateway-cache"] == "miss"
+    assert openai.judged == 1 and openai.chat == 2
 
 
 @respx.mock
 def test_same_question_with_a_different_system_prompt_is_a_miss(client, vectors, monkeypatch):
     turn_on(monkeypatch)
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    chat = respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    openai = mock_openai()
     question = {"role": "user", "content": "What's the capital of France?"}
 
     post(client, {"model": "gpt-4o-mini", "messages": [question]}, headers={})
@@ -176,21 +230,21 @@ def test_same_question_with_a_different_system_prompt_is_a_miss(client, vectors,
                 headers={})
 
     assert resp.headers["x-gateway-cache"] == "miss"
-    assert chat.call_count == 2
+    assert openai.chat == 2
 
 
 @respx.mock
 def test_shadow_mode_records_the_would_be_hit_but_never_serves_it(client, vectors, monkeypatch):
     turn_on(monkeypatch, mode="shadow")
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    chat = respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    openai = mock_openai()
 
     post(client, ask("What's the capital of France?"), headers={})
     wait_for(lambda: vectors.entries)
     resp = post(client, ask("capital of france"), headers={})
 
     assert resp.headers["x-gateway-cache"] == "miss"  # the client sees nothing different
-    assert chat.call_count == 2
+    assert openai.chat == 2
     wait_for(lambda: vectors.shadow)
     team, record = vectors.shadow[0]
     assert team == "test-team"
@@ -198,6 +252,7 @@ def test_shadow_mode_records_the_would_be_hit_but_never_serves_it(client, vector
     assert record["question"] == "capital of france"
     assert record["matched_question"] == "What's the capital of France?"
     assert record["cached_answer"] == record["fresh_answer"] == "hello"
+    assert record["judge"] == 0.99  # judged after the answer went back, so shadow mode never waits for it
     assert record["same"] is None  # for a person (or a judge) to label later
 
 
@@ -206,7 +261,7 @@ def test_shadow_mode_keeps_pairs_under_the_threshold_too(client, vectors, monkey
     # Shadow mode is for picking a threshold, so it has to see what a lower one would serve.
     turn_on(monkeypatch, mode="shadow", threshold=0.95)
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    mock_openai()
 
     post(client, ask("How do I cancel my order?"), headers={})
     wait_for(lambda: vectors.entries)
@@ -214,13 +269,14 @@ def test_shadow_mode_keeps_pairs_under_the_threshold_too(client, vectors, monkey
 
     wait_for(lambda: vectors.shadow)
     assert vectors.shadow[0][1]["similarity"] == 0.93
+    assert vectors.shadow[0][1]["judge"] == 0.01
 
 
 @respx.mock
 def test_exact_hit_comes_first_and_needs_no_embedding(client, vectors, monkeypatch):
     turn_on(monkeypatch)
     embeddings = respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    mock_openai()
 
     post(client, ask("capital of france"), headers={})
     wait_for(lambda: vectors.entries and stored_keys(client))
@@ -234,7 +290,7 @@ def test_exact_hit_comes_first_and_needs_no_embedding(client, vectors, monkeypat
 def test_cache_off_for_a_request_turns_off_both(client, vectors, monkeypatch):
     turn_on(monkeypatch)
     embeddings = respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    mock_openai()
 
     post(client, ask("capital of france"), headers={"x-gateway-cache": "off"})
 
@@ -247,12 +303,12 @@ def test_cache_off_for_a_request_turns_off_both(client, vectors, monkeypatch):
 def test_slow_embeddings_are_a_miss(client, vectors, monkeypatch):
     turn_on(monkeypatch)
     respx.post(EMBEDDINGS_URL).mock(side_effect=httpx.ReadTimeout("took longer than 500 ms"))
-    chat = respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    openai = mock_openai()
 
     resp = post(client, ask("capital of france"), headers={})
 
     assert resp.status_code == 200 and resp.headers["x-gateway-cache"] == "miss"
-    assert chat.call_count == 1
+    assert openai.chat == 1
     time.sleep(0.1)
     assert vectors.entries == {}  # nothing to store without a vector
 
@@ -261,7 +317,7 @@ def test_slow_embeddings_are_a_miss(client, vectors, monkeypatch):
 def test_breaker_stops_calling_a_failing_embeddings_api(client, vectors, monkeypatch):
     turn_on(monkeypatch)
     embeddings = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(500))
-    respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    mock_openai()
 
     statuses = [post(client, ask(f"question {i}"), headers={}).status_code for i in range(5)]
 
@@ -274,7 +330,7 @@ def test_vector_store_down_is_a_miss(client, vectors, monkeypatch):
     turn_on(monkeypatch)
     vectors.down = True
     respx.post(EMBEDDINGS_URL).mock(side_effect=fake_embeddings)
-    respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    mock_openai()
 
     resp = post(client, ask("capital of france"), headers={})
 
@@ -357,7 +413,7 @@ def test_a_lost_index_is_a_miss_not_an_outage():
 
     stub = StubRedis()
     vectors = semantic.RedisVectors(stub)
-    cache = semantic.SemanticCache(StubEmbedder(), vectors)
+    cache = semantic.SemanticCache(StubEmbedder(), None, vectors)
     lookup = semantic.Lookup("p", "q")
 
     async def run():
