@@ -25,7 +25,7 @@ import router
 import semantic
 from config import load_config
 from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, ROUTE_DECISIONS,
-                     SEMANTIC_LOOKUPS, SEMANTIC_SIMILARITY, RequestMetrics)
+                     ROUTE_SHADOW, ROUTE_SHADOW_USD, SEMANTIC_LOOKUPS, SEMANTIC_SIMILARITY, RequestMetrics)
 from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
@@ -100,6 +100,7 @@ async def lifespan(app: FastAPI):
     cache_redis = open_cache_redis()  # one pool for both caches: they live in the same Redis
     app.state.cache = cache.ResponseCache(cache_redis)
     app.state.semantic = open_semantic(app.state.http, cache_redis)
+    app.state.route_shadow = router.ShadowLog(cache_redis)  # measurements, so they live with the disposable data
     yield
     await app.state.http.aclose()
     await app.state.budgets.stop()  # before the pool closes: writes the last rows
@@ -196,11 +197,14 @@ async def chat_completions(
     # A route ("auto") picks a model from the request alone, before anything is called (DECISIONS.md P).
     route_headers = {}
     route = CONFIG.routes.get(request.model)
+    chosen = reason = None
+    shadow_route = False
     if route:
         chosen, reason = router.choose(route, payload, estimate)
-        ROUTE_DECISIONS.labels(route.name, chosen, reason).inc()
+        ROUTE_DECISIONS.labels(caller.team, route.name, chosen, reason).inc()
         route_headers = {"x-gateway-routed-to": chosen, "x-gateway-route-reason": reason}
         targets = CONFIG.models[chosen]
+        shadow_route = router.should_shadow(route, estimate)  # also ask the other model, after answering (P5)
     else:
         targets = CONFIG.models.get(request.model)
     # Only configured names become a label: clients can send any string, and each one would be a new time series.
@@ -265,6 +269,14 @@ async def chat_completions(
             if shadow:
                 _spawn(_save_shadow(caller.team, request.model, lookup, shadow, body))
 
+    def completed(target, body):
+        # Gets the whole answer from the first-choice target only: a fallback's answer is neither stored nor
+        # compared, since it isn't the model the route picked.
+        if caching.enabled:
+            store(target, body)
+        if shadow_route and cache.storable(body):
+            _spawn(_shadow_route(caller.team, route, chosen, reason, payload, body))
+
     if request.stream:
         # Providers only send token usage at the end of a stream if asked to; we need it for cost tracking.
         payload["stream_options"] = {**payload.get("stream_options", {}), "include_usage": True}
@@ -284,7 +296,8 @@ async def chat_completions(
             try:
                 result = await call_target(
                     app.state.http, target, payload, request.stream, on_usage=lambda u, t=target: settle(t, u),
-                    on_complete=(lambda b, t=target: store(t, b)) if caching.enabled and i == 0 else None,
+                    on_complete=(lambda b, t=target: completed(t, b)) if (caching.enabled or shadow_route) and i == 0
+                    else None,
                 )
             finally:
                 if result is None:  # cancelled or crashed before the provider gave a verdict
@@ -348,6 +361,42 @@ async def _save_shadow(team: str, model: str, lookup: semantic.Lookup, match: se
         "question": lookup.question, "matched_question": match.question,
         "cached_answer": _answer_text(match.hit.body), "fresh_answer": _answer_text(body), "same": None,
     })
+
+
+async def _shadow_route(team: str, route: router.Route, served: str, reason: str, payload: dict,
+                        served_body: dict) -> None:
+    # After the answer is sent: ask the route's other model the same thing and save both answers (DECISIONS.md P5).
+    # Paid by the platform: no ledger row, no rate limit. Same breaker as real traffic, so an outage isn't hammered.
+    target = CONFIG.models[route.other(served)][0]  # first choice only: a fallback isn't the model being compared
+    breaker = app.state.breakers.get(target.provider.name, target.model)
+    permit = breaker.allow()
+    if permit is None:
+        ROUTE_SHADOW.labels(team, "skipped").inc()
+        return
+    answer = {}
+    shadow_payload = {k: v for k, v in payload.items() if k not in ("stream", "stream_options")}
+    result = None
+    try:
+        result = await call_target(app.state.http, target, shadow_payload, False, on_complete=answer.update)
+    finally:
+        if result is None:
+            breaker.release(permit)
+    if isinstance(result, Failure):
+        if result.kind == "unsupported":
+            breaker.release(permit)  # never reached the provider
+        else:
+            breaker.record_failure(permit)
+        ROUTE_SHADOW.labels(team, "failed").inc()
+        return
+    breaker.record_success(permit)
+    if not cache.storable(answer):  # cut off, filtered or an error: not a fair comparison
+        ROUTE_SHADOW.labels(team, "failed").inc()
+        return
+    ROUTE_SHADOW_USD.labels(team).inc(pricing.cost_micros(CONFIG.prices[target.deployment], answer.get("usage")) / 1e6)
+    at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    record = router.shadow_record(route, team, reason, served, payload, served_body, answer, at)
+    saved = await app.state.route_shadow.save(team, record)
+    ROUTE_SHADOW.labels(team, "saved" if saved else "failed").inc()
 
 
 async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int) -> None:

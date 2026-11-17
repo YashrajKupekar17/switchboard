@@ -68,10 +68,16 @@ SEMANTIC_STEP_SECONDS = Histogram(
 )
 
 # --- routing (DECISIONS.md P) ---
-# reason is one of a fixed set (default, tools, turns, long_prompt), so it's safe as a label.
+# reason is one of a fixed set (default, tools, turns, long_prompt), so it's safe as a label. team too: there are
+# few, and a rule that suits one team's traffic can waste money on another's (DECISIONS.md P4).
 ROUTE_DECISIONS = Counter(
-    "gateway_route_decisions_total", "Which model a route picked, and which rule decided", ["route", "model", "reason"],
+    "gateway_route_decisions_total", "Which model a route picked, and which rule decided",
+    ["team", "route", "model", "reason"],
 )
+
+# Shadow mode: saved, failed (the other model's call failed or was cut off), skipped (its breaker was open).
+ROUTE_SHADOW = Counter("gateway_route_shadow_total", "Shadow answers from a route's other model", ["team", "result"])
+ROUTE_SHADOW_USD = Counter("gateway_route_shadow_usd_total", "What shadow answers cost the platform", ["team"])
 
 # --- cost / usage ---
 TOKENS = Counter("gateway_tokens_total", "Tokens used, from the provider's usage report", ["deployment", "kind"])

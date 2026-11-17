@@ -42,6 +42,7 @@ routes:
     default: gpt-4o-mini
     upgrade_to: gpt-4o
     upgrade_if: {has_tools: true, min_turns: 3, min_prompt_tokens: 1000}
+    shadow_sample: 0  # tests that want shadow mode set it to 1
 
 rate_limits:
   default: {rpm: 1000, tpm: 1000000}  # high enough that only the rate limit tests ever hit it

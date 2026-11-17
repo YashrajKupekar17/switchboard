@@ -129,7 +129,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 3: per-team API keys, rate limits, budgets, and everything running in Docker
 - [x] Phase 4: exact caching, semantic caching (embedding + LLM judge) with shadow mode and an evaluation script
 - [x] Phase 5a: `auto` routing by rules (a router, not a cascade: DECISIONS.md P)
-- [ ] Phase 5b: shadow mode for the router, with a pairwise judge
+- [x] Phase 5b: shadow mode for the router, with a pairwise judge (scripts/route_eval.py)
 - [ ] Phase 6: mock provider, load tests with Locust, published numbers
 
 ## Docs

@@ -136,7 +136,10 @@ def load_config(path: str) -> Config:
         for field in ("default", "upgrade_to"):
             if r.get(field) not in models:
                 raise RuntimeError(f"route {name!r}: {field} must be a model under `models`, got {r.get(field)!r}")
-        routes[name] = Route(name, r["default"], r["upgrade_to"], Rules(**(r.get("upgrade_if") or {})))
+        sample = r.get("shadow_sample", 0)
+        if not 0 <= sample <= 1:
+            raise RuntimeError(f"route {name!r}: shadow_sample must be between 0 and 1, got {sample!r}")
+        routes[name] = Route(name, r["default"], r["upgrade_to"], Rules(**(r.get("upgrade_if") or {})), sample)
 
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})

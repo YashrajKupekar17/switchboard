@@ -830,17 +830,28 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   - **3,000 or more estimated prompt tokens.** More input to keep track of.
 - **These are starting guesses, not measurements.** Short questions can still be hard ("prove there are infinitely many primes"), and long ones easy ("summarise this email"). The numbers are in the config so they can be changed once P5 measures them. Each rule can be turned off with `null` or `false`.
 - **What the client sees:** `x-gateway-routed-to: fast` and `x-gateway-route-reason: tools`, so a team can see every decision. The ledger keeps `model = auto` and the deployment that answered, so the cost is charged at the chosen model's price.
-- **Metric:** `gateway_route_decisions_total{route, model, reason}`.
+- **Metric:** `gateway_route_decisions_total{team, route, model, reason}`. `team` was added after the first version: a rule can suit one team and waste money on another (a support chat reaches 6 turns with "ok" and "thanks"), and without it you couldn't see which team a rule was firing for.
 - **Order:** auth → rate limit → budget → route → exact cache → semantic cache → router (fallbacks). The route is picked before the cache, so the same request always gets the same route and the same cache key.
 
-### P5. Next: is the cheap answer good enough? (shadow mode, not built yet)
-- **Shadow mode:** serve the model the team asked for, record what the router would have picked, and for a sample of requests where it would have picked the cheap model, generate the cheap answer too (about 1/15 of the cost of the real request).
-- **A pairwise judge:** "here's the question, answer A (strong) and answer B (cheap). Is B as good as A?" Comparing against a reference is far easier than grading one answer alone, which is how MT-Bench and Chatbot Arena evaluate models. Asked twice with the order swapped, against *position bias*. It runs offline, never on a request's path.
-- **The result:** per team, "the cheap answer was as good in X% of cases", and labelled data to train or test a better router (P2).
+### P5. Is the cheap answer good enough? Shadow mode and a pairwise judge
+- **What it does:** for a sample of `auto` requests (`shadow_sample`, 5% in `config.yaml`), after the answer is sent, the gateway asks the route's *other* model the same thing and saves both answers in `redis-cache` (`route_shadow:{team}`, the last 1,000 per team, kept 7 days). Both directions: if the cheap model answered, the strong one is asked too, and the other way round. Upgrades show whether a rule spends money for nothing; defaults show hard requests no rule catches.
+- **Only `auto` requests.** A team sending a model by name isn't sampled: there's no route to compare against, and mapping every model name to a route is more config and more edge cases. A team has to switch to `auto` before it can be measured; that's the price of keeping it simple.
+- **The platform pays.** Shadow calls write no ledger row and don't touch a team's rate limit or budget: a team shouldn't pay for our measurements. Their cost is in `gateway_route_shadow_usd_total{team}`, and their tokens still show in `gateway_tokens_total`, which counts all provider usage.
+- **What's not sampled:** prompts over ~4,000 tokens (the record keeps the whole conversation, in a cache that evicts), answers that were cut off or filtered (not a fair comparison), and answers from a fallback provider (not the model the route picked). The shadow call uses the same breaker as real traffic, so an outage isn't hammered by measurements; if the breaker is open it's skipped.
+- **The judge is offline:** `scripts/route_eval.py judge` asks gpt-4o "which answer is better for the user, 1, 2 or tie?", twice with the answers swapped. Comparing two answers is far easier than grading one alone; it's how MT-Bench and Chatbot Arena evaluate models. Only a verdict both orders agree on counts: `cheap_as_good`, `strong_better`, otherwise `unsure` (*position bias*). It never runs on a request's path, so its cost and latency don't matter much.
+- **`route_eval.py table`** prints, per team and per rule, how often the cheap answer was as good, and says when a rule looks like waste (≥ 90% as good) or when the default misses hard requests (> 10% strong better). Fewer than ~30 records per rule: too few to act on.
+- **Known limits of the judge:**
+  - **It can't see a mistake both answers make.** Pairwise comparison checks the cheap answer *against* the strong one, not against the truth (real example in P6: strawberry).
+  - **Self-preference:** gpt-4o judging gpt-4o against gpt-4o-mini may favour its own style.
+  - **Length bias:** judges prefer longer answers; "Joyful." vs a full sentence came out `unsure`.
+- **Next:** per-team `upgrade_if` overrides, set from this table (P3 said not before there's data; this is the data).
 
 ### P6. Tests and the real check
-- **15 tests:** each rule, just under each rule, only user messages counting as turns, rules switched off, config validation, `auto` calling the chosen model with the right headers, a named model never being routed, and the ledger charging the chosen model.
-- **Mutation checks:** off-by-one on the turn count, counting every message as a turn, and always calling the default model each made tests fail.
+- **33 tests:**
+  - **routing:** each rule, just under each rule, only user messages counting as turns, rules switched off, config validation, `auto` calling the chosen model with the right headers, decisions counted per team, a named model never being routed, and the ledger charging the chosen model;
+  - **shadow mode:** sampling, which answer is strong and which cheap whichever was served, the other model being asked after answering, streams, the platform paying, a failed shadow call saving nothing, and no shadow for fallbacks, cut-off answers or when sampling is off;
+  - **the judge:** only a verdict both orders agree on counts, and tool calls are shown to it.
+- **Mutation checks:** off-by-one on the turn count, counting every message as a turn, always calling the default model, swapping strong and cheap in the record, counting one order's verdict, shadowing fallback answers, and shadowing cut-off answers each made tests fail. The last one only after a test was added for it: the first run of the checks found the gap.
 - **Real run** (3 copies behind nginx, real OpenAI):
 
 | Request | Routed to | Reason | Ledger |
@@ -848,4 +859,23 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 | "Say hi in 3 words." | fast (gpt-4o-mini) | default | 5 µ$ |
 | A weather question with a `get_weather` tool | strong (gpt-4o) | tools | 250 µ$ |
 | "Count to 3.", streamed | fast (gpt-4o-mini) | default | 7 µ$ |
+
+- **Real shadow run** (8 `auto` requests, sampling at 100% for the test, then judged):
+
+| Request | Routed | Cheap (gpt-4o-mini) | Strong (gpt-4o) | Verdict |
+|---|---|---|---|---|
+| Capital of Japan | default | Tokyo | Tokyo | cheap as good |
+| Synonym for "happy" | default | "Joyful." | a full sentence | unsure (length bias) |
+| Bat and ball, $1.10 | default | **0.10 (wrong)** | 0.05 | **strong better** |
+| R's in "strawberry" | default | **2 (wrong)** | **2 (wrong)** | cheap as good |
+| Weather in Paris (tool) | tools | same tool call | same tool call | cheap as good |
+| Raining in Mumbai (tool) | tools | same tool call | same tool call | cheap as good |
+| 6 turns of "ok", "thanks", then shipping | turns | similar | similar | cheap as good |
+| 6 turns of "ok", "cool", then 12 × 12 | turns | 144 | 144 | cheap as good |
+
+- **What it showed:**
+  - **The turn rule upgraded chats that were easy.** Turn count says how long a chat is, not how hard the last question is.
+  - **A short hard question slipped through.** The bat-and-ball puzzle went to the cheap model, which got it wrong. No rule on length or turns can see that.
+  - **The judge can't catch a shared mistake.** Both models said "strawberry" has 2 r's (it has 3), and the judge called it a tie.
+  - 8 records is far too few to change any rule; it's a check that the pipeline works end to end. The 8 shadow calls cost the platform $0.0006.
 

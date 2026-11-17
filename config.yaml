@@ -69,6 +69,10 @@ routes:
       has_tools: true          # the request offers tools
       min_turns: 6             # 6+ user messages in the conversation
       min_prompt_tokens: 3000  # a long prompt (estimated tokens)
+    # Shadow mode (DECISIONS.md P5): for this share of requests, after the answer is sent, also ask the other
+    # model and save both answers, for scripts/route_eval.py to compare. The platform pays for these calls:
+    # they don't count against a team's budget or rate limit (gateway_route_shadow_usd_total shows the cost).
+    shadow_sample: 0.05
 
 # Per-team limits (DECISIONS.md K). Each team has two buckets: requests per minute and tokens per minute.
 # A bucket holds one minute's worth, so a team can burst up to its limit, then gets a steady rate.
