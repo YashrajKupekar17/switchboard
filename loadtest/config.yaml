@@ -1,0 +1,26 @@
+# Gateway config for load tests (DECISIONS.md Q): one provider, the mock, so no test ever reaches a real one.
+# Limits and budgets are far above anything a test sends: we're measuring the gateway's work, not watching it refuse.
+
+providers:
+  mock:
+    base_url: http://mock:9000/v1  # no api_key_env: the mock takes no key
+
+models:
+  mock:
+    - provider: mock
+      model: mock-model
+
+prices:
+  mock/mock-model: {input: 0.15, output: 0.60}  # gpt-4o-mini's, so budgets and the ledger do the same work as in real use
+
+rate_limits:
+  default: {rpm: 10000000, tpm: 10000000000}
+  gateway_copies: 1
+
+budgets:
+  default: {soft_usd: 1000000, max_usd: 1000000}
+
+cache:
+  default: {enabled: false}
+  teams:
+    loadtest-cache: {enabled: true}  # the `cache` target: every request is an exact hit

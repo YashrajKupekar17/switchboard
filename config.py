@@ -58,6 +58,8 @@ class Config:
     default_cache: CacheSettings
     team_cache: dict[str, CacheSettings]
     routes: dict[str, Route]  # route name ("auto") -> how it picks a model
+    max_connections: int = 1000  # to all providers together, per gateway copy (DECISIONS.md Q2)
+    overload_target_ms: int = 100  # gateway time that means a queue: new chat requests get 503 (Q5); 0 = never
 
     def limits_for(self, team: str) -> Limits:
         return self.team_limits.get(team, self.default_limits)
@@ -141,6 +143,14 @@ def load_config(path: str) -> Config:
             raise RuntimeError(f"route {name!r}: shadow_sample must be between 0 and 1, got {sample!r}")
         routes[name] = Route(name, r["default"], r["upgrade_to"], Rules(**(r.get("upgrade_if") or {})), sample)
 
+    max_connections = raw.get("max_connections", 1000)
+    if not isinstance(max_connections, int) or max_connections < 1:
+        raise RuntimeError(f"max_connections must be a whole number above 0, got {max_connections!r}")
+
+    overload_target_ms = raw.get("overload_target_ms", 100)
+    if not isinstance(overload_target_ms, int) or overload_target_ms < 0:
+        raise RuntimeError(f"overload_target_ms must be a whole number of milliseconds (0 = off), got {overload_target_ms!r}")
+
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})
     return Config(
@@ -155,4 +165,6 @@ def load_config(path: str) -> Config:
         default_cache=CacheSettings(**default_cache),
         team_cache=team_cache,
         routes=routes,
+        max_connections=max_connections,
+        overload_target_ms=overload_target_ms,
     )

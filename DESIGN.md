@@ -273,11 +273,18 @@ List every metric: name, type (counter, histogram, gauge), and labels.
 - What test scenarios will you run (steady load, spike, provider outage, cache-heavy)?
 - What's the bottleneck likely to be, and how will you confirm it?
 
-**Results:**
+**Decision:** overhead, measured open-loop with k6 against a mock provider with a fixed delay; one gateway copy on one CPU; py-spy to find the cause of each limit. Details in DECISIONS.md Q.
 
-| Scenario | RPS | p50 | p95 | p99 | Error % |
-|----------|-----|-----|-----|-----|---------|
-|          |     |     |     |     |         |
+**Results** (one copy, one CPU; added latency over the mock; 0 errors in every run; full table in DECISIONS.md Q6):
+
+| Scenario | RPS | Shed | p50 | p99 |
+|----------|-----|------|-----|-----|
+| Non-streamed | 300 | 0 | +2 ms | +97 ms |
+| Non-streamed | 500 | 5% | +5 ms | +308 ms |
+| Streamed, time to first token | 200 | 5% | +9 ms | +245 ms |
+| Exact cache hits, total | 800 | 3% | 1.0 ms | 160 ms |
+
+**The bottleneck:** first httpx's default pool of 100 connections (~90 RPS), then httpcore's O(n²) pool bookkeeping (88% of the CPU at 150 RPS). After both fixes the profile is flat: the remaining cost is the async Python stack itself.
 
 ---
 

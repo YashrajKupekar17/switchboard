@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import random
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -23,10 +24,12 @@ import pricing
 import ratelimit
 import router
 import semantic
+import shedding
 from config import load_config
+from transport import AiohttpTransport
 from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, ROUTE_DECISIONS,
                      ROUTE_SHADOW, ROUTE_SHADOW_USD, SEMANTIC_LOOKUPS, SEMANTIC_SIMILARITY, RequestMetrics)
-from upstream import FINAL_STATUS, RETRYABLE, Failure, call_target
+from upstream import FINAL_STATUS, POOL_WAIT, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -51,6 +54,13 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     stream: bool = False
+
+
+def open_http() -> httpx.AsyncClient:
+    # One shared client for the whole app = one connection pool, reused by every request. httpx's interface on
+    # aiohttp's pool: httpcore's own pool used 88% of the CPU under load (DECISIONS.md Q3). Its size caps how
+    # many provider calls this copy can have open at once (Q2).
+    return httpx.AsyncClient(transport=AiohttpTransport(CONFIG.max_connections))
 
 
 async def open_key_store():
@@ -88,8 +98,7 @@ def open_semantic(http: httpx.AsyncClient, cache_redis: redis.Redis) -> Optional
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One shared client for the whole app = one connection pool, reused by every request.
-    app.state.http = httpx.AsyncClient()
+    app.state.http = open_http()
     app.state.breakers = Breakers()  # in this process's memory, by design (DECISIONS.md G4)
     app.state.key_store = await open_key_store()
     app.state.keys = keys.KeyCache(app.state.key_store)  # in-process cache in front of Postgres (J2)
@@ -119,8 +128,21 @@ def _spawn(coro) -> None:
     task.add_done_callback(_background.discard)
 
 
+OVERLOAD = shedding.Overload(CONFIG.overload_target_ms / 1000)
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(RequestMetrics)
+# Added last, so it runs first: a refused request costs as little as possible (Q5). Refusals aren't in the
+# request metrics; gateway_shed_total counts them.
+app.add_middleware(shedding.Shedder, overload=OVERLOAD)
+
+
+def _own_part_done(http_request: Request) -> None:
+    # The gateway's own work for this request is done; what's left is waiting on others (the semantic cache's
+    # OpenAI calls, the provider). Its time is the load shedding signal (Q5). Counted once per request.
+    arrived = getattr(http_request.state, "arrived", None)
+    if arrived is not None:
+        http_request.state.arrived = None
+        OVERLOAD.record(time.perf_counter() - arrived)
 
 
 class AuthError(Exception):
@@ -231,9 +253,12 @@ async def chat_completions(
         hit_headers = {**_limit_headers(limits, decision), **_budget_headers(budget, spend)}
         if hit:
             CACHE_LOOKUPS.labels(request.model, "hit").inc()
+            _own_part_done(http_request)
             return _serve_hit(caller, request, hit, estimate, wants_usage, {**hit_headers, "x-gateway-cache": "hit"})
         CACHE_LOOKUPS.labels(request.model, "miss").inc()
         cache_headers = {"x-gateway-cache": "miss"}
+
+    _own_part_done(http_request)
 
     # Semantic cache, only after an exact miss: an exact hit is one Redis read, this is an API call (DECISIONS.md O).
     lookup = vector = shadow = None
@@ -322,6 +347,12 @@ async def chat_completions(
             if result.kind == "unsupported":
                 breaker.release(permit)  # never reached the provider: says nothing about its health
                 break
+            if result.kind == "overloaded":
+                # This copy is full, not the provider broken (Q2): leave its breaker alone, and don't fall back,
+                # since every target shares the same full pool.
+                breaker.release(permit)
+                log.warning("overloaded: no free provider connection within %ss", POOL_WAIT)
+                return _all_failed(request.model, failures)
 
             breaker.record_failure(permit)
             level = logging.ERROR if result.kind in ("auth", "config") else logging.WARNING  # our own setup is broken: alert
@@ -486,14 +517,19 @@ def _all_failed(model: str, failures: list) -> JSONResponse:
     # A real provider failure outranks "unsupported": a 400 would wrongly blame the client.
     last = next((f for _, f in reversed(failures) if f.kind != "unsupported"), failures[-1][1])
     headers = {"x-gateway-attempts": _attempts(failures)}
-    if last.kind in ("rate_limit", "circuit_open"):
+    if last.kind in ("rate_limit", "circuit_open", "overloaded"):
         headers["Retry-After"] = last.retry_after or "1"
     unsupported = last.kind == "unsupported"
+    message, kind = f"all providers failed for model {model!r}", "upstream_error"
+    if unsupported:
+        message, kind = last.detail, "invalid_request_error"
+    elif last.kind == "overloaded":
+        message, kind = "this gateway copy is at capacity, retry shortly", "gateway_overloaded"
     return JSONResponse(
         status_code=FINAL_STATUS[last.kind],
         content={"error": {
-            "message": last.detail if unsupported else f"all providers failed for model {model!r}",
-            "type": "invalid_request_error" if unsupported else "upstream_error",
+            "message": message,
+            "type": kind,
             "attempts": [{"provider": t.provider.name, "kind": f.kind, "detail": f.detail} for t, f in failures],
         }},
         headers=headers,

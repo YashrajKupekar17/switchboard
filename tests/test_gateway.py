@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -5,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+import upstream
 from tests.conftest import TEST_KEY
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
@@ -163,3 +165,40 @@ def test_unknown_model_is_rejected_without_calling_any_provider(client):
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "model_not_found"
     assert not openai.called and not ollama.called
+
+
+# --- one write per SSE event (DECISIONS.md Q4) ---
+
+
+async def _lines(items, then_fail=False):
+    for item in items:
+        yield item
+    if then_fail:
+        raise httpx.ReadError("connection reset by provider")
+
+
+def _relay(items, then_fail=False):
+    async def collect():
+        return [w async for w in upstream.relay_stream(_lines(items, then_fail), 0.0, "openai/gpt-4o-mini")]
+    return asyncio.run(collect())
+
+
+def test_stream_sends_each_event_in_one_write():
+    writes = _relay(['data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}', "",
+                     'data: {"choices":[{"index":0,"delta":{"content":"!"}}]}', "", "data: [DONE]", ""])
+
+    assert writes == ['data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+                      'data: {"choices":[{"index":0,"delta":{"content":"!"}}]}\n\n', "data: [DONE]\n\n"]
+
+
+def test_stream_without_a_final_blank_line_still_sends_the_last_event():
+    assert _relay(["data: [DONE]"]) == ["data: [DONE]\n"]
+
+
+def test_mid_stream_failure_drops_the_unfinished_event_so_the_error_event_parses():
+    writes = _relay(['data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}', "",
+                     'data: {"choices":[{"index":0,"delta":{"content":"half"}}]}'], then_fail=True)
+
+    assert len(writes) == 2
+    assert "half" not in "".join(writes)
+    assert json.loads(writes[1][len("data: "):])["error"]["type"] == "upstream_error"

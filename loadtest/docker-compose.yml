@@ -1,0 +1,36 @@
+# Load tests (DECISIONS.md Q). Added on top of the main file, so everything else (Redis, Postgres, nginx) is the same:
+#   docker compose -f docker-compose.yml -f loadtest/docker-compose.yml up -d --build
+#   loadtest/run.sh <scenario> <rate>
+# This replaces the normal gateway with one copy that only knows the mock. Run the first command without
+# the second -f to go back.
+services:
+  gateway:
+    deploy:
+      replicas: 1
+      resources:
+        limits: {cpus: "1"}  # one copy, one CPU: the numbers are per copy, and k6 and the mock get the other CPUs
+    environment:
+      GATEWAY_CONFIG: /loadtest/config.yaml
+    volumes:
+      - ./loadtest:/loadtest:ro
+
+  mock:
+    image: switchboard:dev  # already has Starlette and uvicorn
+    command: ["uvicorn", "--app-dir", "/loadtest", "mock_provider:app", "--host", "0.0.0.0", "--port", "9000",
+              "--workers", "4", "--log-level", "warning"]
+    volumes:
+      - ./loadtest:/loadtest:ro
+    environment:
+      MOCK_TTFT_MS: ${MOCK_TTFT_MS:-300}
+      MOCK_TOKENS: ${MOCK_TOKENS:-40}
+      MOCK_TOKENS_PER_S: ${MOCK_TOKENS_PER_S:-50}
+      MOCK_ERROR_RATE: ${MOCK_ERROR_RATE:-0}
+    healthcheck:  # the image's own check asks port 8000
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=2)"]
+
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: ["loadtest"]  # never started by `up`, only by `docker compose run k6`
+    volumes:
+      - ./loadtest:/loadtest
+    working_dir: /loadtest

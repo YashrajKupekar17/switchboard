@@ -79,6 +79,15 @@ ROUTE_DECISIONS = Counter(
 ROUTE_SHADOW = Counter("gateway_route_shadow_total", "Shadow answers from a route's other model", ["team", "result"])
 ROUTE_SHADOW_USD = Counter("gateway_route_shadow_usd_total", "What shadow answers cost the platform", ["team"])
 
+# --- capacity (DECISIONS.md Q) ---
+# The gateway's own time per request: from our middleware until we call the provider or serve a cache hit. Its
+# overhead, and the load shedding signal (Q5): a queue anywhere inside this copy shows up here.
+GATEWAY_SECONDS = Histogram(
+    "gateway_own_seconds", "Time a request spends in the gateway before the provider is called (or a hit is served)",
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
+)
+SHED = Counter("gateway_shed_total", "Chat requests refused with 503 because this copy was overloaded")
+
 # --- cost / usage ---
 TOKENS = Counter("gateway_tokens_total", "Tokens used, from the provider's usage report", ["deployment", "kind"])
 

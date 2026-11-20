@@ -26,8 +26,11 @@ from metrics import ATTEMPTS, TPOT, TTFT, record_usage
 
 log = logging.getLogger("gateway")
 
-NON_STREAM_TIMEOUT = httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=5.0)
-STREAM_TIMEOUT = httpx.Timeout(connect=3.0, read=30.0, write=10.0, pool=5.0)  # read = max gap between chunks
+# pool = how long to wait for a free connection. Waiting means this copy is full (DECISIONS.md Q2), and the
+# request would only get slower, so give up after 1 s and let the client retry, likely on another copy.
+POOL_WAIT = 1.0
+NON_STREAM_TIMEOUT = httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=POOL_WAIT)
+STREAM_TIMEOUT = httpx.Timeout(connect=3.0, read=30.0, write=10.0, pool=POOL_WAIT)  # read = max gap between chunks
 FIRST_CHUNK_TIMEOUT = 10.0  # seconds to wait for a stream's first chunk; until then we can still fall back
 
 # Failure kinds that are safe to retry: the provider either never got the request or failed fast.
@@ -38,12 +41,14 @@ FINAL_STATUS = {
     "auth": 502, "config": 502, "rate_limit": 503, "server": 502, "connect": 502, "network": 502, "timeout": 504,
     "circuit_open": 503,  # we skipped it ourselves; Retry-After says when the next trial is
     "unsupported": 400,  # no target could handle the request's features (e.g. tools on an Anthropic-only model)
+    "overloaded": 503,  # no free connection in this copy: our limit, not the provider's
 }
 
 
 @dataclass
 class Failure:
-    kind: str  # "auth" | "config" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open" | "unsupported"
+    kind: str  # "auth" | "config" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open"
+    #            "unsupported" | "overloaded"
     detail: str
     retry_after: Optional[str] = None
 
@@ -62,7 +67,11 @@ def classify_status(status: int) -> Optional[str]:
 
 
 def classify_exception(exc: Exception) -> Failure:
-    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+    if isinstance(exc, httpx.PoolTimeout):
+        # Every connection in our pool was busy. The provider never saw the request and may be perfectly fine:
+        # blaming it would open its breaker and turn our overload into an outage (DECISIONS.md Q2).
+        return Failure("overloaded", repr(exc), retry_after="1")
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         return Failure("connect", repr(exc))  # request never reached the provider
     if isinstance(exc, httpx.TimeoutException):
         return Failure("timeout", repr(exc))  # provider got it but is too slow; retrying piles on load
@@ -196,9 +205,17 @@ async def relay_stream(
     usage = None
     chunks = [] if on_complete else None  # kept only when someone wants the whole answer (the cache)
     finished = False
+    # An SSE event is its lines up to a blank line, and a client can't use it before then. So send each event in
+    # one write, not one per line: every write goes through Starlette, uvicorn and the socket, and per-line writes
+    # doubled the cost of a stream (DECISIONS.md Q4).
+    event = []
 
     try:
         async for line in lines:
+            event.append(line + "\n")
+            if line == "":
+                yield "".join(event)
+                event = []
             if line == "data: [DONE]":
                 finished = True
             elif line.startswith("data: "):
@@ -209,8 +226,11 @@ async def relay_stream(
                     usage = chunk["usage"]
                 if chunks is not None:
                     chunks.append(chunk)
-            yield line + "\n"
+        if event:  # the provider ended without a final blank line
+            yield "".join(event)
     except (httpx.HTTPError, StreamError) as exc:
+        # Lines of an unfinished event are dropped: sent before the error event, they'd merge into it (an SSE
+        # event's data lines are joined) and break it.
         # Provider died mid-stream. The 200 and some chunks are already sent, so we can't fall back.
         # Send an error event (the OpenAI SDK raises APIError on it) so the client knows the answer is incomplete.
         log.warning("upstream failed mid-stream: %r", exc)

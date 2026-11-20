@@ -879,3 +879,87 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   - **The judge can't catch a shared mistake.** Both models said "strawberry" has 2 r's (it has 3), and the judge called it a tie.
   - 8 records is far too few to change any rule; it's a check that the pipeline works end to end. The 8 shadow calls cost the platform $0.0006.
 
+
+---
+
+## Q. Load testing, and what it found (Phase 6)
+
+### Q1. How it's measured
+- **What:** the gateway's **overhead**, the time it adds on top of the provider. Real providers take 1-10 s and vary a lot, which would hide a few milliseconds and cost money. So a **mock provider** (`loadtest/mock_provider.py`) answers after a delay we set: 300 ms to the first token, then 40 more tokens at 50 per second, 1.08 s in all. Run the same load straight at the mock and through the gateway, and subtract. Percentiles are subtracted from percentiles (gateway p99 - mock p99): "the gateway made the slow tail this much worse", not the overhead of any one request.
+- **Open-loop load, with k6:** requests arrive at a fixed rate whether or not earlier ones have finished (`constant-arrival-rate`). The plan said Locust, but every Locust user waits for its answer before sending the next request, so when the gateway stalls the load drops, and the slow moments go unrecorded (*coordinated omission*). k6 counts any request it couldn't start in `dropped`; a run with many dropped isn't a clean run.
+- **Setup:** `loadtest/docker-compose.yml` on top of the normal stack: **one gateway copy limited to 1 CPU**, the mock (4 workers), and k6, all on Docker's network so Docker Desktop's port forwarding isn't measured. Redis and Postgres are the real ones, and limits and budgets are set too high to trigger, so every request does all its normal work. Each step runs 30 s. `loadtest/run.sh` writes one JSON line per run.
+- **Finding the cause, not guessing:** `py-spy` attached to the running gateway from a sidecar container shows where its CPU time goes. Before the first profile, the guesses were key lookups (they're cached in memory, J2) and parsing stream chunks (1.4% of CPU). Both were wrong.
+- **Limits of the setup:** one laptop (M1, Docker VM with 8 CPUs and 4 GB), so k6, the mock and the gateway share the machine. The mock has no TLS: a real provider adds a handshake per new connection, which keep-alive avoids. Each number is one 30 s run, and runs of the same load differed by up to ~20%.
+
+### Q2. httpx's default pool capped a copy at ~90 RPS, and the breaker turned that into an outage
+- **What happened:** fine up to 75 RPS (+3 ms p50, +17 ms p99), then at 100 RPS p99 jumped to 8.3 s, and at 150 RPS most requests failed in **2 ms**.
+- **Why, step by step:**
+  1. `httpx.AsyncClient()` keeps at most **100 connections**. Each is held for the whole answer (1.08 s), so the ceiling is 100 / 1.08 ≈ 92 RPS (*Little's Law*: in flight = rate × time).
+  2. Above that, requests waited for a free connection; after httpx's 5 s, `PoolTimeout`.
+  3. `classify_exception` filed `PoolTimeout` with connection errors, as the **provider's** failure.
+  4. 5 of those **opened the breaker**, and every request failed at once with 503, while the mock was answering in 1.08 s the whole time.
+- **Fix:**
+  - **`max_connections` in `config.yaml`, default 1,000**, sized by Little's Law (200 RPS × 5 s answers = 1,000). There is still a limit: without one, a provider that slows down lets connections pile up until the copy runs out of memory.
+  - **A full pool is our overload, not the provider's failure:** a new failure kind, `overloaded`. It leaves the breaker alone, doesn't fall back (every target shares the same pool), waits 1 s at most instead of 5, and returns **503 `gateway_overloaded` with `Retry-After: 1`**, so the client can retry, likely on another copy.
+- **Not done: one pool per provider** (*bulkhead*). The pool is shared, so one slow provider can still take every connection and starve the healthy ones.
+- **Production terms:** *Little's Law*, *cascading failure*, *bulkhead*. The general lesson: a breaker must only count failures that are the dependency's fault.
+
+### Q3. httpcore's pool used 88% of the CPU: aiohttp underneath, httpx on top
+- **What happened:** with the pool fixed, 150 RPS was fine and 200 RPS sent the CPU to 100% and p50 to 14.8 s.
+- **The profile:** 88% of the CPU was in httpcore's pool bookkeeping (`_assign_requests_to_connections`, `is_idle`). Our own code, auth, Redis, logging and metrics together were under 5%. In httpcore 1.0.9, the cleanup step loops over every connection and, inside that loop, builds a list of every connection: **O(n²) in open connections**, run every time a request joins or leaves the pool. Double the concurrency, four times the CPU. Pull requests to fix it exist (encode/httpcore #924, #1035); none is in our version.
+- **Others hit it too:** LiteLLM moved its transport to aiohttp (its own benchmark: ~50 → 224 RPS per instance), and so did NVIDIA's NeMo Gym.
+- **Options:** (1) keep httpx's interface and put aiohttp underneath, (2) rewrite `upstream.py` on aiohttp, (3) HTTP/2 so a few connections carry everything (the mock can't speak it, and it hides the problem rather than fixing it). **Chose 1:** the streaming and failure code, which took several phases to get right, doesn't change.
+- **Our own transport (`transport.py`), not the `httpx-aiohttp` package:** its mapping turns a full pool into `ConnectTimeout` (Q2's bug again) and a connection dropped *after* sending into `ConnectTimeout` too, which our policy would retry, though the provider may already be answering it. Ours maps each aiohttp error to the kind DESIGN.md section 4 expects, and the connection limit is our own semaphore, so a full pool can only mean overload. It also handles a Python 3.9 race where a timed-out wait could lose a slot for good.
+- **Result:** p50 within 1-5 ms of the mock up to 500 RPS (apart from the ~40 ms in Q6), CPU 68% at 400 RPS. After the change the profile is flat: event loop and sockets 28%, the provider call 19%, FastAPI and pydantic 16%, Redis 9%, uvicorn 9%, our code 8%, logging 3%. That's what an async Python server costs; more throughput from here means more copies.
+- **Testing:** gateway tests use plain httpx (`open_http()` is swapped in conftest) so respx can mock providers. The transport has its own 8 tests against real local servers: each error mapping, slots always coming back, the race, and stream chunks arriving as they're sent.
+
+### Q4. Streams: one write per event, and capacity is events per second
+- **What happened:** streaming used about twice the CPU of non-streamed requests (69% at 100 RPS against 31%), and the knee was ~200 RPS.
+- **Why:** `relay_stream` yielded each line, including the blank line that ends an SSE event, so each chunk made **two** trips through Starlette, the metrics middleware, uvicorn and the socket. A client can't use an event before its blank line anyway.
+- **Fix:** one write per event. A provider that drops mid-event loses that unfinished event: sent before the error event, its lines would merge into it (an event's `data:` lines are joined) and break it. CPU at 100 streamed RPS: 69% → 43%.
+- **The knee hardly moved**, because each event still costs a read from the provider, a `json.loads`, a trip through the middleware and a socket write: ~8,000 events/s per CPU. **So stream capacity is events per second, not requests:** our mock sends 42 events per answer; a real 500-token answer sends ~500, so one copy would hold ~20 such streams per second. Capacity planning has to use answer length.
+
+### Q5. Load shedding: refuse early, and the signal is the gateway's own time
+- **Why:** past capacity, a copy accepts everything and queues it, so every request gets slow together. Cache hits that take 1 ms took **7-9 s** at 1,200 RPS. A fast 503 for some is better than a 10 s wait for all.
+- **First idea, event loop lag (rejected after measuring):** how late a 50 ms sleep wakes up. At 1,200 RPS, with the copy collapsed, only 5% of samples were over 100 ms. The queue wasn't in the loop.
+- **Where it was:** redis-py's default pool runs every Redis call in the process through one `asyncio.Lock`, and opens new connections *while holding it*. Under load all connections are busy, so new ones are opened, and requests queue on the lock. Waiting on a lock costs no CPU, so the loop looks healthy.
+- **Tried redis-py's fixed-size pool (`BlockingConnectionPool`, 50 connections) and reverted:** worse below the knee (p99 at 800 cache-hit RPS: 150 ms → 2.4 s). The 50 assumed a Redis call takes ~0.3 ms; under load a call holds its connection until the busy loop reads the reply, tens of ms, so it needed ~100. Running out made rate limits fail open and cache lookups fail open into misses, which went to the provider and filled all 1,000 connections. **Each limit spilled into the next one.** That's the reason to shed: tuning one part only changes which part fails first.
+- **Decision: the gateway's own time per request, CoDel-style** (`shedding.py`):
+  - From our middleware until we call the provider or serve a cache hit. Normally 1-3 ms. Any queue inside the copy shows up in it: the loop, a lock, a pool.
+  - Provider time is left out, so a slow provider never makes us refuse work. (Counting requests in flight would get this wrong: a provider slowing to 10 s means 10× the requests in flight with the CPU idle.) The semantic cache's OpenAI calls are left out for the same reason.
+  - Like CoDel (a router's queue algorithm, Nichols and Jacobson, 2012), look at the **minimum** over a 100 ms window. A burst makes some requests wait, but if even the fastest one waited longer than the target, there's a standing queue. Then the next 100 ms of chat requests get **503 `gateway_overloaded`, `Retry-After: 1`**. An empty window ends shedding, or shedding everything would stop all new samples and never end.
+  - The shedder is plain ASGI middleware, outside FastAPI, so a refused request is never parsed. `/healthz` is never shed.
+  - **Target 100 ms** (`overload_target_ms`). 50 ms refused 21% of requests at 600 RPS, a load the copy served without shedding at p99 1.76 s; 100 ms refused 5% there. Over the knee both behaved the same.
+- **Where it helps and where it can't** (final runs, Q6): it works for LLM traffic. At 400 streamed RPS, answered streams kept a TTFT p50 of 560 ms and the overflow got an instant 503 (p99 was 5.7 s in the final run and 1.2 s in an earlier one: at twice the knee the tail still varies a lot). But refusing still costs a TCP read, uvicorn's HTTP parsing and a 503, and a cache hit costs only about twice that. At 1,200 cache-hit RPS the copy spent its CPU refusing, requests queued *before* our middleware where the clock can't see them, and answered hits still took 1.4 s. **Shedding in the app only helps when serving costs much more than refusing.** For floods of cheap requests, stop them earlier: the load balancer (nginx `limit_req` / `limit_conn`) or more copies.
+- **Metrics:** `gateway_own_seconds` (the gateway's own time per request: also the overhead, live) and `gateway_shed_total`.
+- **Production terms:** *load shedding*, *admission control*, *CoDel*, *sojourn time*. Further reading: Google SRE book, "Handling Overload"; Netflix's `concurrency-limits` library.
+
+### Q6. Results
+One copy, one CPU, final build. "+" is over the mock alone (non-streamed p50 1,081 ms / p99 1,088 ms; streamed TTFT p50 301 ms / p99 311 ms). Latency is for answered requests only; shed requests are counted, not timed. 0 failed requests in every run.
+
+| Traffic | RPS sent | Shed | p50 | p99 |
+|---|---|---|---|---|
+| Non-streamed | 100 | 0 | +43 ms | +57 ms |
+| | 300 | 0 | +2 ms | +97 ms |
+| | 500 | 5% | +5 ms | +308 ms |
+| | 700 | 15% | +111 ms | +1,148 ms |
+| Streamed (time to first token) | 100 | <1% | +3 ms | +65 ms |
+| | 200 | 5% | +9 ms | +245 ms |
+| | 300 | 21% | +98 ms | +553 ms |
+| | 400 | 35% | +258 ms | +5,359 ms |
+| Exact cache hits (total time) | 200 | 0 | 1.7 ms | 21 ms |
+| | 800 | 3% | 1.0 ms | 160 ms |
+| | 1,200 | 39% | 1,367 ms | 6,127 ms |
+
+- **Against DESIGN.md's requirements:**
+  - **300 RPS at peak:** one copy serves ~500 non-streamed or ~200 streamed (42-event answers) before shedding. Three copies cover the peak with room to spare, for answers this short; for long streamed answers, plan from events per second (Q4).
+  - **Under 20 ms overhead:** met at p50 from 200 to 500 RPS, and not met at p99 under load. **Some runs at 50-150 RPS were +40 ms at p50**, like 100 RPS in the table, while others at the same rates were +2-5 ms; it never showed above 200 RPS. Not explained yet: it isn't Nagle's algorithm (httpx and asyncio both set `TCP_NODELAY`), and it showed up with both transports. Next step: per-stage timing in one request (before the provider, the provider call, after it), not guessing.
+- **Through all of it:** the breaker never opened, since the provider never failed.
+- **Before the fixes (same setup):** 75 RPS was the most a copy could do without errors. At 100 RPS, p99 was 8.3 s. At 150 RPS, 3,805 of 4,500 requests failed.
+
+### Q7. What's not measured yet
+- **Provider failures under load:** the mock failing 20% of requests (breaker and fallback under load), and a provider slowing to 10 s (in flight grows 10×: does `max_connections` hold?). `MOCK_ERROR_RATE` and `MOCK_TTFT_MS` are there for it.
+- **Redis or Postgres going down mid-run.**
+- **Three copies behind nginx**, and nginx's own cost.
+- **The semantic cache**, which needs a mock embeddings endpoint.
+- **The ~40 ms that comes and goes at 50-150 RPS** (Q6).

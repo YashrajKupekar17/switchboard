@@ -167,3 +167,15 @@ def test_recovers_after_cooldown_via_a_trial_request(gw, clock):
 
     assert trial.headers["x-gateway-provider"] == "openai"
     assert after.headers["x-gateway-provider"] == "openai"
+
+
+@respx.mock
+def test_our_full_connection_pool_never_trips_the_providers_breaker(gw):
+    openai = respx.post(OPENAI_URL).mock(side_effect=httpx.PoolTimeout(""))
+    for _ in range(10):
+        gw.post("/v1/chat/completions", json=CHAT_BODY)
+    openai.mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+
+    resp = gw.post("/v1/chat/completions", json=CHAT_BODY)
+
+    assert resp.headers["x-gateway-provider"] == "openai"  # the breaker is still closed

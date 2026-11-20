@@ -91,6 +91,23 @@ Clients can opt out of fallback with the `x-gateway-fallback: off` header.
 
 Alerts are based on TTFT and TPOT rather than total latency. Total latency mostly reflects how long the answer was, so a jump might just mean someone asked for longer answers. TTFT and TPOT only go up when the provider itself gets slower.
 
+**Load tested, and protected from overload.** Load tests run against a mock provider with a fixed delay, so every millisecond above it is the gateway's. One copy on one CPU:
+
+| Traffic | Handled before shedding | Added latency (p50 / p99) |
+|---|---|---|
+| Non-streamed | ~500 requests/s | +5 ms / +308 ms at 500/s |
+| Streamed | ~200 requests/s (~8,000 chunks/s) | +9 ms / +245 ms to first token at 200/s |
+| Exact cache hits | ~800 requests/s | 1 ms / 160 ms total at 800/s |
+
+What the tests found:
+
+- httpx's default pool of 100 connections capped a copy at about 90 requests/s. Worse, the gateway blamed the waits on the provider, so the circuit breaker opened and every request failed while the provider was fine. The pool is now sized in the config, and a full pool returns a 503 that doesn't touch the breaker.
+- httpx's connection pool spent 88% of the CPU on bookkeeping that grows with the square of open connections. Provider calls now go through aiohttp underneath httpx's interface: about 3× the throughput.
+- Streams were sent one line at a time, two writes per chunk. Now it's one write per chunk.
+- Past capacity, a copy queued everything and every request got slow together. Now it sheds: when its own part of the work (before calling the provider) starts taking over 100 ms, it refuses new requests with a fast 503 for the next 100 ms. That keeps answered streams fast at twice their capacity. It can't help with floods of cache hits, which cost almost as little as refusing them: those have to be stopped at the load balancer.
+
+DECISIONS.md section Q has the method, the profiles, the dead ends, and the full results. To run them yourself, see `loadtest/run.sh`.
+
 ## Running it
 
 You need Docker and an OpenAI API key. Python 3.9 or newer is only needed for the scripts and tests.
@@ -130,7 +147,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 4: exact caching, semantic caching (embedding + LLM judge) with shadow mode and an evaluation script
 - [x] Phase 5a: `auto` routing by rules (a router, not a cascade: DECISIONS.md P)
 - [x] Phase 5b: shadow mode for the router, with a pairwise judge (scripts/route_eval.py)
-- [ ] Phase 6: mock provider, load tests with Locust, published numbers
+- [x] Phase 6: mock provider, load tests with k6, published numbers, load shedding (DECISIONS.md Q)
 
 ## Docs
 

@@ -191,3 +191,21 @@ def test_provider_404_is_our_config_error_so_it_falls_back(client):
 
     assert resp.status_code == 200
     assert resp.headers["x-gateway-attempts"] == "openai:config"
+
+
+# --- our own overload (DECISIONS.md Q2) ---
+
+
+@respx.mock
+def test_full_connection_pool_is_our_overload_so_503_and_no_fallback(client):
+    openai = respx.post(OPENAI_URL).mock(side_effect=httpx.PoolTimeout(""))
+    ollama = respx.post(OLLAMA_URL).mock(return_value=ok())
+
+    resp = client.post("/v1/chat/completions", json=CHAT_BODY)
+
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "1"
+    assert resp.headers["x-gateway-attempts"] == "openai:overloaded"
+    assert resp.json()["error"]["type"] == "gateway_overloaded"
+    assert openai.call_count == 1  # never retried: retrying would only add to the queue
+    assert ollama.call_count == 0  # it shares the same full pool

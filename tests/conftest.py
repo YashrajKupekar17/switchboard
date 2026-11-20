@@ -8,6 +8,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")  # fake: tests 
 os.environ["GATEWAY_CONFIG"] = str(Path(__file__).parent / "config.test.yaml")
 
 import fakeredis  # noqa: E402
+import httpx  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -91,7 +92,14 @@ def fake_cache_redis(monkeypatch):
 
 
 @pytest.fixture
-def client(key_store, fake_redis, fake_cache_redis, ledger):
+def plain_http(monkeypatch):
+    # respx intercepts httpx's own transport, so the gateway tests use it. The aiohttp transport main.py uses
+    # has its own tests, against a real local server (test_transport.py).
+    monkeypatch.setattr(main, "open_http", httpx.AsyncClient)
+
+
+@pytest.fixture
+def client(key_store, fake_redis, fake_cache_redis, ledger, plain_http):
     # `with` runs lifespan, so the shared httpx client and the key cache exist. Every request is authenticated.
     with TestClient(main.app, headers=AUTH) as c:
         yield c

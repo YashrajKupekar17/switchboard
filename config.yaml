@@ -116,3 +116,13 @@ cache:
   default: {enabled: false, ttl: 3600, semantic: "off", threshold: 0.70}
   teams:
     search: {enabled: true, semantic: shadow}
+
+# Capacity of each gateway copy (DECISIONS.md Q). Measured with loadtest/, on one CPU per copy.
+# Calls to providers this copy can have open at once. Each one is open for the whole answer, so you need about
+# requests/s x seconds per answer (Little's Law): 200/s x 5 s = 1,000. When all are busy, a request waits up to
+# 1 s for one, then gets 503 gateway_overloaded; that's our limit, so the provider's breaker isn't touched (Q2).
+max_connections: 1000
+# Load shedding (Q5): if, for 100 ms, even the fastest request spent longer than this in the gateway's own part
+# (before calling the provider), the next 100 ms of chat requests get 503 at once. Normally that part takes 1-3 ms.
+# 0 turns it off.
+overload_target_ms: 100
