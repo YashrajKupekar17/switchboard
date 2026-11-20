@@ -1,5 +1,7 @@
 # switchboard
 
+[![tests](https://github.com/YashrajKupekar17/switchboard/actions/workflows/tests.yml/badge.svg)](https://github.com/YashrajKupekar17/switchboard/actions/workflows/tests.yml)
+
 An LLM gateway: one OpenAI-compatible endpoint that sits between your teams and the model providers.
 
 Teams point their existing OpenAI SDK at switchboard by changing `base_url`, and nothing else. Behind that endpoint, switchboard decides which provider and model to call, falls back when a provider is down, stops calling a provider that keeps failing, and records what every request cost and how long it took.
