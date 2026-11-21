@@ -26,6 +26,7 @@ import ratelimit
 import router
 import semantic
 import shedding
+import tags as request_tags
 from config import load_config
 from transport import AiohttpTransport
 from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, ROUTE_DECISIONS,
@@ -210,8 +211,14 @@ async def chat_completions(
     x_gateway_fallback: Optional[str] = Header(default=None),
     x_gateway_cache: Optional[str] = Header(default=None),
     x_gateway_cache_ttl: Optional[str] = Header(default=None),
+    x_gateway_tags: Optional[str] = Header(default=None),
 ):
     payload = request.model_dump(exclude_none=True)
+    try:
+        tags = request_tags.parse(x_gateway_tags)  # before anything is spent: a bad tag is the client's bug to fix
+    except request_tags.BadTags as exc:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": str(exc), "type": "invalid_request_error", "param": "x-gateway-tags", "code": "invalid_tags"}})
 
     # Rate limit right after auth, before anything that costs money or time (DECISIONS.md K).
     limits = CONFIG.limits_for(caller.team)
@@ -230,7 +237,7 @@ async def chat_completions(
 
     def settle(target, usage):
         # Called with the provider's real usage once the answer is done (for a stream, after the last chunk).
-        _spawn(_settle(caller, request.model, target, estimate, usage))
+        _spawn(_settle(caller, request.model, target, estimate, usage, tags))
 
     # A route ("auto") picks a model from the request alone, before anything is called (DECISIONS.md P).
     route_headers = {}
@@ -270,7 +277,8 @@ async def chat_completions(
         if hit:
             CACHE_LOOKUPS.labels(request.model, "hit").inc()
             _own_part_done(http_request)
-            return _serve_hit(caller, request, hit, estimate, wants_usage, {**hit_headers, "x-gateway-cache": "hit"})
+            return _serve_hit(caller, request, hit, estimate, wants_usage, tags,
+                              {**hit_headers, "x-gateway-cache": "hit"})
         CACHE_LOOKUPS.labels(request.model, "miss").inc()
         cache_headers = {"x-gateway-cache": "miss"}
 
@@ -294,7 +302,7 @@ async def chat_completions(
         if result == "hit":
             log.info("semantic hit team=%s similarity=%.4f judge=%.2f entry=%s",
                      caller.team, match.similarity, judged, match.key)
-            return _serve_hit(caller, request, match.hit, estimate, wants_usage, {
+            return _serve_hit(caller, request, match.hit, estimate, wants_usage, tags, {
                 **hit_headers, "x-gateway-cache": "semantic-hit",
                 "x-gateway-cache-similarity": f"{match.similarity:.4f}", "x-gateway-cache-judge": f"{judged:.2f}"})
         if caching.semantic == "shadow" and match and match.similarity >= semantic.SHADOW_FLOOR:
@@ -390,8 +398,8 @@ async def chat_completions(
 
 
 def _serve_hit(caller: keys.KeyInfo, request: ChatRequest, hit: cache.Hit, estimate: int, wants_usage: bool,
-               headers: dict) -> Response:
-    _spawn(_record_hit(caller, request.model, hit, estimate))
+               tags: dict, headers: dict) -> Response:
+    _spawn(_record_hit(caller, request.model, hit, estimate, tags))
     headers = {**headers, "age": str(hit.age), "x-gateway-provider": hit.deployment.split("/", 1)[0]}
     if request.stream:  # stored once as a whole answer, replayed as a stream (N1: stream isn't in the key)
         return StreamingResponse(iter(cache.replay(hit.body, wants_usage)), media_type="text/event-stream",
@@ -454,7 +462,7 @@ async def _shadow_route(team: str, route: router.Route, served: str, reason: str
     ROUTE_SHADOW.labels(team, "saved" if saved else "failed").inc()
 
 
-async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int) -> None:
+async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int, tags: dict) -> None:
     # A hit used no provider tokens: refund the tokens-per-minute estimate. The request itself still counted (N4).
     await app.state.limiter.settle(caller.team, estimate, {"total_tokens": 0})
     price = CONFIG.prices.get(hit.deployment)  # None if that model was removed from the config since
@@ -463,10 +471,12 @@ async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate
     await app.state.budgets.record(
         team=caller.team, key_id=caller.id, model=model, deployment=hit.deployment,
         tokens=pricing.Tokens(0, 0, 0, 0), cost_micros=0, estimated=False, cache_hit=True, saved_micros=saved,
+        tags=tags,
     )
 
 
-async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage: Optional[dict]) -> None:
+async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage: Optional[dict],
+                  tags: dict) -> None:
     await app.state.limiter.settle(caller.team, estimate, usage)
     estimated = not usage
     if estimated:  # stream cut short before the usage report: charge the prompt estimate, and say so
@@ -474,7 +484,7 @@ async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage
     await app.state.budgets.record(
         team=caller.team, key_id=caller.id, model=model, deployment=target.deployment,
         tokens=pricing.split_usage(usage), cost_micros=pricing.cost_micros(CONFIG.prices[target.deployment], usage),
-        estimated=estimated,
+        estimated=estimated, tags=tags,
     )
 
 

@@ -78,6 +78,7 @@ Any other name gets a 404 with code `model_not_found`. The platform team can add
 | `x-gateway-fallback` | `off` | Only try the first provider. You get its answer or its error |
 | `x-gateway-cache` | `on` or `off` | Use the cache for this request, or skip it, whatever your team's default is |
 | `x-gateway-cache-ttl` | seconds, 1 to 604800 | How long to keep this answer in the cache. The default is 1 hour |
+| `x-gateway-tags` | `feature=search,env=prod` | Labels stored with the request's cost, so spend can be split by feature, environment or anything else (section 7) |
 
 ## 5. Headers you get back
 
@@ -107,6 +108,7 @@ Errors come back in OpenAI's shape, `{"error": {"message", "type", "code"}}`, so
 | 404 | `model_not_found` | The model name isn't configured | Use a name from section 3 |
 | 400 | from the provider | Your request was invalid (bad parameter, too long for the model) | Fix the request. It's passed through as the provider sent it, and never tried elsewhere |
 | 400 | `invalid_request_error` | No provider for this model supports a feature you used | Remove the feature or use another model |
+| 400 | `invalid_tags` | `x-gateway-tags` is malformed | Fix the header: up to 10 `name=value` pairs, lowercase names |
 | 400 | `invalid_request_error`, with `param` | The gateway couldn't read the request: no `model`, `messages` not a list | Fix the request |
 | 429 | `rate_limit_exceeded` | Your team is over its requests or tokens per minute | Wait `Retry-After` seconds and retry. The OpenAI SDK does this for you |
 | 429 | `rate_limit_exceeded`, message "request too large" | This one request needs more tokens than your team's whole per-minute limit | Retrying won't help. Shorten it, or ask for a higher limit |
@@ -130,6 +132,8 @@ Each team also has a **monthly budget** in dollars, priced by the model that act
 - At the **max** level, every request gets a 429 `budget_exceeded` until the 1st of next month (UTC).
 
 Cache hits cost nothing against your budget, but still count as a request for the per-minute limit.
+
+**Seeing where the money went.** Your team's total says how much; tags say on what. Send `x-gateway-tags` with your requests (with the OpenAI SDK: `extra_headers={"x-gateway-tags": "feature=search,env=prod"}`), and the platform team's report, `scripts/spend.py --team <yours> --by tag:feature`, splits your spend by it. Names are lowercase letters, digits, `_ . -` (up to 32 characters); values are letters, digits, `_ . : / @ -` (up to 64); at most 10 tags. A malformed header gets a 400 rather than being dropped, so a report is never quietly missing requests. Tags don't change caching: the same question with different tags still gets the same cached answer.
 
 ## 8. The cache
 

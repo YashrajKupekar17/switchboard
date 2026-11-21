@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 
 import httpx
 import pytest
@@ -85,7 +86,7 @@ def test_streams_chunks_through_unchanged(client):
 
 
 @respx.mock
-def test_usage_chunk_is_held_back_unless_the_client_asked_for_it(client, ledger):
+def test_usage_chunk_is_held_back_unless_the_client_asked_for_it(client):
     route = respx.post(OPENAI_URL).mock(
         return_value=httpx.Response(200, content=FAKE_SSE, headers={"content-type": "text/event-stream"})
     )
@@ -97,8 +98,12 @@ def test_usage_chunk_is_held_back_unless_the_client_asked_for_it(client, ledger)
     events = [e for e in resp.text.split("\n\n") if e]
     assert events[-1] == "data: [DONE]"
     assert all(json.loads(e[len("data: "):])["choices"] for e in events[:-1])  # chunk.choices[0] never fails
-    asyncio.run(client.app.state.budgets.flush())
-    assert ledger.rows[-1][8] == 2  # output tokens: still billed from the usage it held back
+    buffer = client.app.state.budgets.buffer  # usage is written in the background, just after the stream ends
+    for _ in range(200):
+        if buffer:
+            break
+        time.sleep(0.01)
+    assert buffer[-1][8] == 2  # output tokens: still billed from the usage it held back
 
 
 @respx.mock

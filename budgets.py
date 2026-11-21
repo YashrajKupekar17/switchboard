@@ -11,6 +11,7 @@ A team over `soft_usd` gets a warning; at `max_usd` its requests are refused unt
 """
 import asyncio
 import datetime as dt
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -49,10 +50,12 @@ CREATE INDEX IF NOT EXISTS usage_ledger_team_time ON usage_ledger (team, created
 -- Added with the response cache (DECISIONS.md N). A hit costs nothing; saved_micros is what it would have cost.
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS saved_micros BIGINT NOT NULL DEFAULT 0;
+-- Request tags (DECISIONS.md T1), e.g. {"feature": "search", "env": "prod"}. NULL when the request had none.
+ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS tags JSONB;
 """
 
 COLUMNS = ["created_at", "team", "key_id", "model", "deployment", "uncached_tokens", "cached_tokens",
-           "cache_write_tokens", "output_tokens", "cost_micros", "estimated", "cache_hit", "saved_micros"]
+           "cache_write_tokens", "output_tokens", "cost_micros", "estimated", "cache_hit", "saved_micros", "tags"]
 
 # Add to the month's total only if it exists. If it doesn't, the next check rebuilds it from the ledger,
 # which will include this row; adding here would create a total that's missing the rest of the month.
@@ -171,10 +174,11 @@ class Budgets:
     # --- recording, after each request ---
 
     async def record(self, *, team, key_id, model, deployment, tokens, cost_micros, estimated,
-                     cache_hit=False, saved_micros=0) -> None:
+                     cache_hit=False, saved_micros=0, tags=None) -> None:
         now = self.clock()
         self.buffer.append((now, team, key_id, model, deployment, tokens.uncached, tokens.cached,
-                            tokens.cache_write, tokens.output, cost_micros, estimated, cache_hit, saved_micros))
+                            tokens.cache_write, tokens.output, cost_micros, estimated, cache_hit, saved_micros,
+                            json.dumps(tags) if tags else None))  # asyncpg takes JSONB as text
         if len(self.buffer) > MAX_BUFFER:
             dropped = len(self.buffer) - MAX_BUFFER
             del self.buffer[:dropped]
