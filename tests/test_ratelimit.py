@@ -35,7 +35,7 @@ def test_bucket_allows_a_burst_up_to_the_limit_then_refuses():
         rl, _ = limiter(rpm=3)
         results = [await rl.check("t", 10) for _ in range(4)]
         assert [d.allowed for d in results] == [True, True, True, False]
-        assert results[3].exceeded == "requests"
+        assert results[3].exceeded.kind == "requests"
         assert results[3].retry_after == pytest.approx(20)  # 3 per minute = one coin every 20 s
     run(go())
 
@@ -59,7 +59,7 @@ def test_refused_request_takes_nothing_from_either_bucket():
     async def go():
         rl, _ = limiter(rpm=3, tpm=100)
         refused = await rl.check("t", 500)  # too many tokens
-        assert not refused.allowed and refused.exceeded == "tokens"
+        assert not refused.allowed and refused.exceeded.kind == "tokens"
         ok = await rl.check("t", 10)
         assert ok.remaining_requests == 2  # the refused request didn't spend a request coin
         assert ok.remaining_tokens == 90
@@ -81,7 +81,7 @@ def test_settle_charges_the_real_usage_and_can_go_into_debt():
         assert (await rl.check("t", 100)).allowed  # estimate: 100, bucket 1000 -> 900
         await rl.settle("t", 100, {"total_tokens": 1500})  # the answer was long: charge 1400 more -> -500
         d = await rl.check("t", 10)
-        assert not d.allowed and d.exceeded == "tokens"
+        assert not d.allowed and d.exceeded.kind == "tokens"
         assert d.retry_after == pytest.approx(30.6)  # (10 - -500) tokens at 1000/60 per second
 
         clock.now += 31
@@ -120,8 +120,8 @@ def test_redis_script_and_local_fallback_agree():
         keys = ["rl:t:rpm", "rl:t:tpm"]
         for t, requests, tokens, force in steps:
             now = 1_000_000 + t
-            r = await script(keys=keys, args=[now, 3, 1000, requests, tokens, int(force)])
-            from_redis = [int(r[0]), float(r[1]), float(r[2]), float(r[3]), int(r[4])]
+            r = await script(keys=keys, args=[now, int(force), 3, 1000, requests, tokens])
+            from_redis = [int(r[0]), float(r[1]), int(r[2]), *(float(t) for t in r[3:])]
             from_local = local.take(keys, now, [3, 1000], [requests, tokens], force)
             assert from_redis == pytest.approx(from_local)
     run(go())

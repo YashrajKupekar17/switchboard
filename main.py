@@ -107,6 +107,8 @@ async def lifespan(app: FastAPI):
     app.state.breakers = Breakers()  # in this process's memory, by design (DECISIONS.md G4)
     app.state.key_store = await open_key_store()
     app.state.keys = keys.KeyCache(app.state.key_store)  # in-process cache in front of Postgres (J2)
+    app.state.last_used = keys.LastUsed(app.state.key_store)  # written in one batch a minute (T3)
+    app.state.last_used.start()
     shared = open_redis()  # one Redis connection pool for rate limits and budgets
     app.state.limiter = ratelimit.RateLimiter(shared, CONFIG.limits_for, CONFIG.gateway_copies)
     app.state.budgets = budgets.Budgets(shared, await open_ledger(app.state.key_store), CONFIG.budget_for)
@@ -118,6 +120,7 @@ async def lifespan(app: FastAPI):
     yield
     await app.state.http.aclose()
     await app.state.budgets.stop()  # before the pool closes: writes the last rows
+    await app.state.last_used.stop()
     await app.state.key_store.close()
     await app.state.limiter.close()
     await app.state.cache.close()
@@ -188,6 +191,12 @@ async def require_key(request: Request, authorization: Optional[str] = Header(de
         raise AuthError(503, "authentication is temporarily unavailable", "auth_unavailable")
     if info is None:
         raise AuthError(401, "invalid or revoked API key", "invalid_api_key")
+    # Checked on every request against the clock, not only when the key is looked up: a key held in the 60 s cache
+    # still stops at its expiry time (DECISIONS.md T3).
+    if info.expired(budgets.utcnow()):
+        raise AuthError(401, f"API key {info.prefix} expired on {info.expires_at:%Y-%m-%d %H:%M} UTC: "
+                             "ask your platform team for a new one", "expired_api_key")
+    request.app.state.last_used.saw(info.id)
     request.state.team = info.team
     return info
 
@@ -221,19 +230,18 @@ async def chat_completions(
             "message": str(exc), "type": "invalid_request_error", "param": "x-gateway-tags", "code": "invalid_tags"}})
 
     # Rate limit right after auth, before anything that costs money or time (DECISIONS.md K).
-    limits = CONFIG.limits_for(caller.team)
     estimate = ratelimit.estimate_tokens(payload["messages"])
-    decision = await app.state.limiter.check(caller.team, estimate)
+    decision = await app.state.limiter.check(caller.team, estimate, caller)  # the team's buckets and the key's
     if not decision.allowed:
-        RATE_LIMITED.labels(caller.team, decision.exceeded).inc()
-        return _rate_limited(caller.team, limits, decision, estimate)
+        RATE_LIMITED.labels(caller.team, decision.exceeded.kind).inc()
+        return _rate_limited(caller, decision, estimate)
 
     # Then the monthly budget (DECISIONS.md L).
     budget = CONFIG.budget_for(caller.team)
-    spend = await app.state.budgets.check(caller.team)
+    spend = await app.state.budgets.check(caller.team, caller)  # the team's budget, then the key's own
     if not spend.allowed:
         RATE_LIMITED.labels(caller.team, "budget").inc()
-        return _over_budget(caller.team, budget, spend)
+        return _over_budget(caller, budget, spend)
 
     def settle(target, usage):
         # Called with the provider's real usage once the answer is done (for a stream, after the last chunk).
@@ -273,7 +281,7 @@ async def chat_completions(
         key = cache.cache_key(caller.team, payload)  # before stream_options is added below: it isn't in the key
         hit = await app.state.cache.get(key)
         wants_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
-        hit_headers = {**_limit_headers(limits, decision), **_budget_headers(budget, spend)}
+        hit_headers = {**_limit_headers(decision), **_budget_headers(budget, spend)}
         if hit:
             CACHE_LOOKUPS.labels(request.model, "hit").inc()
             _own_part_done(http_request)
@@ -364,7 +372,7 @@ async def chat_completions(
                 log.info("route team=%s model=%s -> %s/%s", caller.team, request.model, target.provider.name, target.model)
                 if failures:
                     result.headers["x-gateway-attempts"] = _attempts(failures)
-                result.headers.update(_limit_headers(limits, decision))
+                result.headers.update(_limit_headers(decision))
                 result.headers.update(_budget_headers(budget, spend))
                 result.headers.update(cache_headers)
                 result.headers.update(route_headers)
@@ -464,7 +472,7 @@ async def _shadow_route(team: str, route: router.Route, served: str, reason: str
 
 async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate: int, tags: dict) -> None:
     # A hit used no provider tokens: refund the tokens-per-minute estimate. The request itself still counted (N4).
-    await app.state.limiter.settle(caller.team, estimate, {"total_tokens": 0})
+    await app.state.limiter.settle(caller.team, estimate, {"total_tokens": 0}, caller)
     price = CONFIG.prices.get(hit.deployment)  # None if that model was removed from the config since
     saved = pricing.cost_micros(price, hit.body.get("usage")) if price else 0
     CACHE_SAVED.labels(caller.team).inc(saved / 1_000_000)
@@ -477,7 +485,7 @@ async def _record_hit(caller: keys.KeyInfo, model: str, hit: cache.Hit, estimate
 
 async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage: Optional[dict],
                   tags: dict) -> None:
-    await app.state.limiter.settle(caller.team, estimate, usage)
+    await app.state.limiter.settle(caller.team, estimate, usage, caller)
     estimated = not usage
     if estimated:  # stream cut short before the usage report: charge the prompt estimate, and say so
         usage = {"prompt_tokens": estimate, "completion_tokens": 0}
@@ -491,24 +499,31 @@ async def _settle(caller: keys.KeyInfo, model: str, target, estimate: int, usage
 def _budget_headers(budget: budgets.Budget, spend: budgets.Spend) -> dict:
     if spend.spent_micros is None:  # Redis down: we don't know, so we don't pretend to
         return {}
-    return {
+    headers = {
         "x-gateway-budget-spent-usd": pricing.micros_to_usd(spend.spent_micros),
         "x-gateway-budget-soft-usd": pricing.usd(budget.soft_usd)[1:],
         "x-gateway-budget-max-usd": pricing.usd(budget.max_usd)[1:],
     }
+    if spend.key_max_micros is not None:  # this key has its own budget, inside the team's
+        headers["x-gateway-key-budget-spent-usd"] = pricing.micros_to_usd(spend.key_spent_micros)
+        headers["x-gateway-key-budget-max-usd"] = pricing.micros_to_usd(spend.key_max_micros)
+    return headers
 
 
-def _over_budget(team: str, budget: budgets.Budget, spend: budgets.Spend) -> JSONResponse:
+def _over_budget(caller: keys.KeyInfo, budget: budgets.Budget, spend: budgets.Spend) -> JSONResponse:
     now = budgets.utcnow()
     next_month = (budgets.month_start(now) + datetime.timedelta(days=32)).replace(day=1)
     headers = _budget_headers(budget, spend)
     headers["Retry-After"] = str(int((next_month - now).total_seconds()))
+    if spend.refused_by == "key":
+        whose = f"key {caller.label} has reached its own monthly budget of {pricing.usd(spend.key_max_micros / 1e6)}"
+    else:
+        whose = f"team {caller.team!r} has reached its monthly budget of {pricing.usd(budget.max_usd)}"
     return JSONResponse(
         status_code=429,
         # OpenAI uses insufficient_quota for "you're out of credit", which is what this is.
         content={"error": {
-            "message": f"team {team!r} has reached its monthly budget of {pricing.usd(budget.max_usd)}; "
-                       f"it resets on {next_month:%Y-%m-%d} (UTC)",
+            "message": f"{whose}; it resets on {next_month:%Y-%m-%d} (UTC)",
             "type": "insufficient_quota",
             "code": "budget_exceeded",
         }},
@@ -516,29 +531,31 @@ def _over_budget(team: str, budget: budgets.Budget, spend: budgets.Spend) -> JSO
     )
 
 
-def _limit_headers(limits: ratelimit.Limits, decision: ratelimit.Decision) -> dict:
-    # The same headers OpenAI sends, so clients that already read them work unchanged.
+def _limit_headers(decision: ratelimit.Decision) -> dict:
+    # The same headers OpenAI sends, so clients that already read them work unchanged. With a key limit tighter than
+    # its team's, they describe whichever bucket runs out first: that's the one the client will hit.
     return {
-        "x-ratelimit-limit-requests": str(limits.rpm),
+        "x-ratelimit-limit-requests": str(decision.limit_requests),
         "x-ratelimit-remaining-requests": str(decision.remaining_requests),
-        "x-ratelimit-limit-tokens": str(limits.tpm),
+        "x-ratelimit-limit-tokens": str(decision.limit_tokens),
         "x-ratelimit-remaining-tokens": str(decision.remaining_tokens),
     }
 
 
-def _rate_limited(team: str, limits: ratelimit.Limits, decision: ratelimit.Decision, estimate: int) -> JSONResponse:
-    if decision.exceeded == "tokens" and estimate > limits.tpm:
+def _rate_limited(caller: keys.KeyInfo, decision: ratelimit.Decision, estimate: int) -> JSONResponse:
+    bucket = decision.exceeded
+    who = f"team {caller.team!r}" if bucket.scope == "team" else f"key {caller.label}"
+    if bucket.kind == "tokens" and estimate > bucket.cap:
         # It would never fit, however long the client waits. OpenAI also answers this with a 429.
-        message = f"request too large for team {team!r}: about {estimate} tokens, limit {limits.tpm} per minute"
+        message = f"request too large for {who}: about {estimate} tokens, limit {bucket.cap} per minute"
     else:
-        per_minute = limits.rpm if decision.exceeded == "requests" else limits.tpm
-        message = (f"rate limit reached for team {team!r} on {decision.exceeded} per minute: "
-                   f"limit {per_minute}, try again in {decision.retry_after:.1f}s")
-    headers = _limit_headers(limits, decision)
+        message = (f"rate limit reached for {who} on {bucket.kind} per minute: "
+                   f"limit {bucket.cap}, try again in {decision.retry_after:.1f}s")
+    headers = _limit_headers(decision)
     headers["Retry-After"] = str(max(1, math.ceil(decision.retry_after)))  # the OpenAI SDK waits this long, then retries
     return JSONResponse(
         status_code=429,
-        content={"error": {"message": message, "type": decision.exceeded, "code": "rate_limit_exceeded"}},
+        content={"error": {"message": message, "type": bucket.kind, "code": "rate_limit_exceeded"}},
         headers=headers,
     )
 

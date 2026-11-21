@@ -10,7 +10,9 @@ Ask the platform team for a key for your team. They run `scripts/keys.py create 
 
 Treat it like any API key: keep it in an environment variable or a secret store, never in code. A revoked key stops working within 60 seconds.
 
-Your key decides which team you are, and so which rate limits, budget and cache settings apply.
+Your key decides which team you are, and so which rate limits, budget and cache settings apply. A key can also have its own, tighter limits and monthly budget, and an expiry date: ask for them when you get the key. A batch job with its own small budget can't spend your whole team's.
+
+**Rotating a key without an outage.** Ask the platform team to rotate it. You get a new key with the same settings, and the old one keeps working for a grace period (24 hours by default), then expires. Deploy the new key to every service within that time. The platform team can see when each key was last used, so they can tell you if something still uses the old one.
 
 ## 2. Connect
 
@@ -95,8 +97,9 @@ Any other name gets a 404 with code `model_not_found`. The platform team can add
 | `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests` | `60`, `57` | Your team's requests per minute |
 | `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens` | `100000`, `98200` | Your team's tokens per minute |
 | `x-gateway-budget-spent-usd`, `-soft-usd`, `-max-usd` | `12.40`, `50.00`, `60.00` | Your team's spend this month, its warning level and its hard limit |
+| `x-gateway-key-budget-spent-usd`, `-max-usd` | `3.10`, `20.00` | Only for a key with its own budget: this key's spend this month, and its limit |
 
-The rate-limit headers are the same ones OpenAI sends, so code that already reads them keeps working.
+The rate-limit headers are the same ones OpenAI sends, so code that already reads them keeps working. If your key has its own limits, they describe whichever runs out first, your key's or your team's.
 
 ## 6. Errors, and what to do
 
@@ -105,14 +108,15 @@ Errors come back in OpenAI's shape, `{"error": {"message", "type", "code"}}`, so
 | Status | `code` or `type` | What happened | What to do |
 |---|---|---|---|
 | 401 | `missing_api_key`, `invalid_api_key` | No key, a wrong one, or a revoked one | Check the key. Don't retry |
+| 401 | `expired_api_key` | The key passed its expiry date. The message says when | Ask for a new key, or use the one you were given when it was rotated |
 | 404 | `model_not_found` | The model name isn't configured | Use a name from section 3 |
 | 400 | from the provider | Your request was invalid (bad parameter, too long for the model) | Fix the request. It's passed through as the provider sent it, and never tried elsewhere |
 | 400 | `invalid_request_error` | No provider for this model supports a feature you used | Remove the feature or use another model |
 | 400 | `invalid_tags` | `x-gateway-tags` is malformed | Fix the header: up to 10 `name=value` pairs, lowercase names |
 | 400 | `invalid_request_error`, with `param` | The gateway couldn't read the request: no `model`, `messages` not a list | Fix the request |
-| 429 | `rate_limit_exceeded` | Your team is over its requests or tokens per minute | Wait `Retry-After` seconds and retry. The OpenAI SDK does this for you |
+| 429 | `rate_limit_exceeded` | Your team, or your key, is over its requests or tokens per minute. The message says which | Wait `Retry-After` seconds and retry. The OpenAI SDK does this for you |
 | 429 | `rate_limit_exceeded`, message "request too large" | This one request needs more tokens than your team's whole per-minute limit | Retrying won't help. Shorten it, or ask for a higher limit |
-| 429 | `budget_exceeded` | Your team has spent its monthly budget | Don't retry: it resets on the 1st (UTC). Talk to the platform team |
+| 429 | `budget_exceeded` | Your team, or your key, has spent its monthly budget. The message says which | Don't retry: it resets on the 1st (UTC). Talk to the platform team |
 | 502 | `upstream_error` | Every provider failed | Retry later. `error.attempts` says why |
 | 503 | `upstream_error`, with `Retry-After` | Providers are rate-limiting us, or all are known to be down | Retry after `Retry-After` |
 | 503 | `gateway_overloaded` | This gateway copy is at capacity | Retry after 1 s; you'll probably reach a less busy copy |
@@ -123,13 +127,14 @@ Errors come back in OpenAI's shape, `{"error": {"message", "type", "code"}}`, so
 
 ## 7. Rate limits and budgets
 
-Each team has two limits per minute: **requests** and **tokens** (default 60 and 100,000; the platform team can set yours). A team can burst up to a minute's worth at once, then gets a steady rate.
+Each team has two limits per minute: **requests** and **tokens** (default 60 and 100,000; the platform team can set yours). A team can burst up to a minute's worth at once, then gets a steady rate. A key can have its own limits too, inside its team's: a request needs room in both, and one refused by the key's limit doesn't use up any of the team's.
 
 Tokens are estimated from your prompt before the call, so a request can be refused before it costs anything. Once the answer arrives, the estimate is replaced by the real count. Long answers can take you briefly below zero; the next requests wait until it's paid back.
 
 Each team also has a **monthly budget** in dollars, priced by the model that actually answered:
 - Past the **soft** level, the platform team gets an alert. Your requests still work, and the `x-gateway-budget-*` headers show where you are.
 - At the **max** level, every request gets a 429 `budget_exceeded` until the 1st of next month (UTC).
+- A key with its own monthly budget is refused once it reaches it, while the team's other keys keep working. A key's budget can't let it past the team's.
 
 Cache hits cost nothing against your budget, but still count as a request for the per-minute limit.
 

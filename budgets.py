@@ -8,6 +8,8 @@ of a SUM over the ledger. The total is only a cache: it expires every 5 minutes 
 ledger, so anything it missed (a Redis outage, a restart) is corrected within 5 minutes.
 
 A team over `soft_usd` gets a warning; at `max_usd` its requests are refused until the month resets.
+A key can also have its own monthly `max_usd`, inside its team's (T2), so one runaway service can't spend the
+whole team's budget. It's kept the same way: a running total per key, rebuilt from the ledger by key_id.
 """
 import asyncio
 import datetime as dt
@@ -50,6 +52,8 @@ CREATE INDEX IF NOT EXISTS usage_ledger_team_time ON usage_ledger (team, created
 -- Added with the response cache (DECISIONS.md N). A hit costs nothing; saved_micros is what it would have cost.
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS saved_micros BIGINT NOT NULL DEFAULT 0;
+-- Per-key totals (DECISIONS.md T2) are rebuilt with a SUM over one key's month, like a team's.
+CREATE INDEX IF NOT EXISTS usage_ledger_key_time ON usage_ledger (key_id, created_at);
 -- Request tags (DECISIONS.md T1), e.g. {"feature": "search", "env": "prod"}. NULL when the request had none.
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS tags JSONB;
 """
@@ -60,8 +64,10 @@ COLUMNS = ["created_at", "team", "key_id", "model", "deployment", "uncached_toke
 # Add to the month's total only if it exists. If it doesn't, the next check rebuilds it from the ledger,
 # which will include this row; adding here would create a total that's missing the rest of the month.
 ADD_IF_EXISTS = """
-if redis.call('EXISTS', KEYS[1]) == 1 then return redis.call('INCRBY', KEYS[1], ARGV[1]) end
-return false
+for _, key in ipairs(KEYS) do
+  if redis.call('EXISTS', key) == 1 then redis.call('INCRBY', key, ARGV[1]) end
+end
+return 0
 """
 
 
@@ -81,8 +87,11 @@ class Budget:
 
 @dataclass(frozen=True)
 class Spend:
-    spent_micros: Optional[int]  # None when Redis is down and we couldn't check
+    spent_micros: Optional[int]  # the team's this month; None when Redis is down and we couldn't check
     allowed: bool
+    key_spent_micros: Optional[int] = None  # only for a key with its own budget
+    key_max_micros: Optional[int] = None
+    refused_by: str = ""  # "team" | "key", when not allowed
 
 
 def month_of(now: dt.datetime) -> str:
@@ -103,6 +112,13 @@ class PostgresLedger:
 
     async def insert(self, rows: List[tuple]) -> None:
         await self.pool.copy_records_to_table("usage_ledger", records=rows, columns=COLUMNS)  # one round trip
+
+    async def key_month_total(self, key_id: int, since: dt.datetime) -> int:
+        total = await self.pool.fetchval(
+            "SELECT COALESCE(SUM(cost_micros), 0) FROM usage_ledger WHERE key_id = $1 AND created_at >= $2",
+            key_id, since,
+        )
+        return int(total)
 
     async def month_total(self, team: str, since: dt.datetime) -> int:
         # SUM of a BIGINT is a NUMERIC in Postgres (it could overflow BIGINT), which asyncpg returns as Decimal.
@@ -132,34 +148,49 @@ class Budgets:
 
     # --- the check, before each request ---
 
-    async def check(self, team: str) -> Spend:
+    async def check(self, team: str, key=None) -> Spend:
+        """The team's budget, then the key's own if it has one (a keys.KeyInfo, or None)."""
         budget = self.budget_for(team)
         now = self.clock()
-        spent = await self._spent(team, now)
+        month = month_of(now)
+        spent = await self._total(f"spend:{team}:{month}", lambda: self.ledger.month_total(team, month_start(now)),
+                                  f"team {team}")
         if spent is None:
             return Spend(None, True)  # fail open: the ledger still records everything (L5)
         BUDGET_SPENT.labels(team).set(spent / 1_000_000)
         BUDGET_USED.labels(team).set(spent / budget.soft_micros if budget.soft_micros else 0)
         if spent >= budget.soft_micros:
             await self._warn_once(team, now, spent, budget)
-        return Spend(spent, spent < budget.max_micros)
+        if spent >= budget.max_micros:
+            return Spend(spent, False, refused_by="team")
+        if key is None or key.max_usd is None:
+            return Spend(spent, True)
 
-    async def _spent(self, team: str, now: dt.datetime) -> Optional[int]:
+        key_max = round(key.max_usd * 1_000_000)
+        key_spent = await self._total(f"spend:key:{key.id}:{month}",
+                                      lambda: self.ledger.key_month_total(key.id, month_start(now)), f"key {key.id}")
+        if key_spent is None:
+            return Spend(spent, True)
+        if key_spent >= key_max:
+            return Spend(spent, False, key_spent, key_max, refused_by="key")
+        return Spend(spent, True, key_spent, key_max)
+
+    async def _total(self, redis_key: str, rebuild, what: str) -> Optional[int]:
+        """A running total from Redis, rebuilt from the ledger if it's missing. None if we couldn't tell."""
         if time.monotonic() < self.redis_down_until:
             return None
-        key = f"spend:{team}:{month_of(now)}"
         try:
-            total = await self.redis.get(key)
+            total = await self.redis.get(redis_key)
             if total is None:
-                total = await self.ledger.month_total(team, month_start(now))
+                total = await rebuild()
                 # NX: if another copy rebuilt it first, keep theirs, and read back whichever won.
-                await self.redis.set(key, total, nx=True, ex=TOTAL_TTL)
-                total = await self.redis.get(key) or total
+                await self.redis.set(redis_key, total, nx=True, ex=TOTAL_TTL)
+                total = await self.redis.get(redis_key) or total
             return int(total)
         except (RedisError, OSError) as exc:
             self._redis_failed(exc)
         except (asyncpg.PostgresError, asyncpg.InterfaceError, asyncio.TimeoutError) as exc:
-            log.warning("budget: couldn't rebuild total for %s from the ledger: %r", team, exc)
+            log.warning("budget: couldn't rebuild the total for %s from the ledger: %r", what, exc)
         return None
 
     async def _warn_once(self, team, now, spent, budget):
@@ -187,7 +218,9 @@ class Budgets:
         LEDGER_BUFFERED.set(len(self.buffer))
         if cost_micros and time.monotonic() >= self.redis_down_until:
             try:
-                await self.add_if_exists(keys=[f"spend:{team}:{month_of(now)}"], args=[cost_micros])
+                month = month_of(now)  # the team's total and the key's (if it's tracked), in one call
+                await self.add_if_exists(keys=[f"spend:{team}:{month}", f"spend:key:{key_id}:{month}"],
+                                         args=[cost_micros])
             except (RedisError, OSError) as exc:
                 self._redis_failed(exc)
 

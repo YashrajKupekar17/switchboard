@@ -20,6 +20,7 @@ import asyncpg  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 import tags  # noqa: E402
+from pricing import usd  # noqa: E402
 
 COLUMNS = {  # --by name -> SQL. Only these, or a tag: never text from the command line in the query.
     "team": "l.team",
@@ -62,19 +63,20 @@ async def main(args):
     sql, params = build_query(args.by or ["team"], dt.datetime(year, month, 1, tzinfo=dt.timezone.utc), args.team)
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
     try:
-        rows = await conn.fetch(sql, *params)
+        # SUM of a BIGINT is NUMERIC in Postgres, which asyncpg returns as Decimal: back to whole micro-dollars.
+        rows = [{**r, "cost": int(r["cost"]), "saved": int(r["saved"])} for r in await conn.fetch(sql, *params)]
     finally:
         await conn.close()
 
     headers = [*(args.by or ["team"]), "requests", "cost", "saved by cache", "cache hits"]
-    table = [[*(str(r[f"g{i}"]) for i in range(len(headers) - 4)), str(r["requests"]), f"${r['cost'] / 1e6:,.4f}",
-              f"${r['saved'] / 1e6:,.4f}", f"{100 * r['hits'] / r['requests']:.0f}%"] for r in rows]
+    table = [[*(str(r[f"g{i}"]) for i in range(len(headers) - 4)), str(r["requests"]), usd(r["cost"] / 1e6),
+              usd(r["saved"] / 1e6), f"{100 * r['hits'] / r['requests']:.0f}%"] for r in rows]
     total_cost = sum(r["cost"] for r in rows)
     widths = [max(len(h), *(len(row[i]) for row in table)) if table else len(h) for i, h in enumerate(headers)]
     print("  ".join(h.ljust(w) for h, w in zip(headers, widths)))
     for row in table:
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)))
-    print(f"\n{args.month}: ${total_cost / 1e6:,.4f} across {sum(r['requests'] for r in rows)} requests")
+    print(f"\n{args.month}: {usd(total_cost / 1e6)} across {sum(r['requests'] for r in rows)} requests")
 
 
 if __name__ == "__main__":

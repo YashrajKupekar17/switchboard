@@ -22,7 +22,12 @@ GRANTS = """
 DO $$ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'gateway') THEN CREATE ROLE gateway LOGIN; END IF;
 END $$;
+-- Exactly the grants below, every time: anything granted earlier, by mistake or by an older version, is removed
+-- first (revoking on a table also revokes its column grants). Same transaction, so there's no moment without them.
+REVOKE ALL ON api_keys, usage_ledger, key_audit FROM gateway;
+REVOKE ALL ON SEQUENCE usage_ledger_id_seq FROM gateway;
 GRANT SELECT ON api_keys TO gateway;                          -- check keys; never create or revoke them
+GRANT UPDATE (last_used_at) ON api_keys TO gateway;           -- that one column only, in batches (DECISIONS.md T3)
 GRANT SELECT, INSERT ON usage_ledger TO gateway;              -- add rows and sum them; never change or delete them
 GRANT USAGE ON SEQUENCE usage_ledger_id_seq TO gateway;       -- needed to INSERT into a BIGSERIAL table
 """

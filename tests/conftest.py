@@ -20,12 +20,18 @@ AUTH = {"Authorization": f"Bearer {TEST_KEY}"}
 
 
 class FakeKeyStore:
-    """Stands in for Postgres: same find() and close(), backed by a dict. Counts lookups."""
+    """Stands in for Postgres: the gateway's find(), touch() and close(), backed by a dict. Counts lookups."""
 
     def __init__(self, active_keys: dict):
         self.by_hash = {keys.hash_key(k): info for k, info in active_keys.items()}
         self.lookups = 0
         self.down = False
+        self.last_used = {}
+
+    async def touch(self, seen):
+        if self.down:
+            raise OSError("connection refused")
+        self.last_used.update(seen)
 
     async def find(self, key_hash):
         self.lookups += 1
@@ -48,6 +54,9 @@ class FakeLedger:
         if self.down:
             raise OSError("connection refused")
         self.rows.extend(rows)
+
+    async def key_month_total(self, key_id, since):
+        return sum(r[9] for r in self.rows if r[2] == key_id and r[0] >= since)
 
     async def month_total(self, team, since):
         return sum(r[9] for r in self.rows if r[1] == team and r[0] >= since)  # r[9] = cost_micros

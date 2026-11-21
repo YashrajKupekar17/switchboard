@@ -1,5 +1,6 @@
-# Runs the test suite on every push and pull request. The tests need no services: Redis and Postgres are faked
-# in tests/conftest.py, and no test reaches a real provider.
+# Runs the test suite on every push and pull request. Redis and providers are faked in tests/conftest.py, and no
+# test reaches a real provider. A real Postgres runs alongside for tests/test_postgres.py: the key store's SQL,
+# its audit trail, and the gateway user's permissions, which fakes can't check.
 name: tests
 
 on:
@@ -10,6 +11,18 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.5  # same as docker-compose.yml
+        env:
+          POSTGRES_USER: switchboard
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: switchboard_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U switchboard" --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgresql://switchboard:ci-only@localhost:5432/switchboard_test
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
