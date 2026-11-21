@@ -69,6 +69,8 @@ Only Chat Completions is available. There's no `/v1/models`, embeddings or Respo
 
 Any other name gets a 404 with code `model_not_found`. The platform team can add models in `config.yaml`.
 
+Your team may be limited to some of these names, to keep costs predictable. Asking for one it can't use gets a 403 `model_not_allowed` that lists what it can. If your team can use `auto` but not the model it upgrades to, `auto` keeps you on the default and says so in `x-gateway-route-reason: upgrade_not_allowed`.
+
 **Fallback.** If the first provider is down, failing, rate-limiting us or very slow, your request goes to the next one on the list without you doing anything. The answer may then come from a different model. The response body's `model` field and the `x-gateway-provider` header say what actually answered. If you need exactly the first model or an error, send `x-gateway-fallback: off`.
 
 **`auto`.** You get `fast` unless your request offers tools, has 6 or more user messages, or has a prompt over about 3,000 tokens; then you get `strong`. The headers `x-gateway-routed-to` and `x-gateway-route-reason` (`default`, `tools`, `turns` or `long_prompt`) say what was picked and why. These rules are starting guesses, not tuned yet.
@@ -89,7 +91,7 @@ Any other name gets a 404 with code `model_not_found`. The platform team can add
 | `x-gateway-provider` | `openai` | Which provider answered |
 | `x-gateway-attempts` | `openai:timeout` | What failed before the answer came. Only present if something did |
 | `x-gateway-routed-to` | `fast` | `auto` only: the model it picked |
-| `x-gateway-route-reason` | `tools` | `auto` only: why |
+| `x-gateway-route-reason` | `tools` | `auto` only: why (`default`, `tools`, `turns`, `long_prompt`, or `upgrade_not_allowed`) |
 | `x-gateway-cache` | `off`, `miss`, `hit`, `semantic-hit` | What the cache did |
 | `x-gateway-cache-similarity` | `0.8683` | Semantic hits only: how close the stored question was |
 | `x-gateway-cache-judge` | `1.00` | Semantic hits only: how sure the judge was that it's the same question |
@@ -109,6 +111,7 @@ Errors come back in OpenAI's shape, `{"error": {"message", "type", "code"}}`, so
 |---|---|---|---|
 | 401 | `missing_api_key`, `invalid_api_key` | No key, a wrong one, or a revoked one | Check the key. Don't retry |
 | 401 | `expired_api_key` | The key passed its expiry date. The message says when | Ask for a new key, or use the one you were given when it was rotated |
+| 403 | `model_not_allowed` | Your team can't use this model. The message lists the ones it can | Use one of those, or ask the platform team |
 | 404 | `model_not_found` | The model name isn't configured | Use a name from section 3 |
 | 400 | from the provider | Your request was invalid (bad parameter, too long for the model) | Fix the request. It's passed through as the provider sent it, and never tried elsewhere |
 | 400 | `invalid_request_error` | No provider for this model supports a feature you used | Remove the feature or use another model |

@@ -229,6 +229,16 @@ async def chat_completions(
         return JSONResponse(status_code=400, content={"error": {
             "message": str(exc), "type": "invalid_request_error", "param": "x-gateway-tags", "code": "invalid_tags"}})
 
+    # Which models this team may ask for (DECISIONS.md T4): before the rate limit, so a refused request uses none of
+    # it. A name that isn't configured at all still gets the 404 below.
+    allowed = CONFIG.models_for(caller.team)
+    if allowed is not None and request.model not in allowed and (request.model in CONFIG.models
+                                                                  or request.model in CONFIG.routes):
+        return JSONResponse(status_code=403, content={"error": {
+            "message": f"team {caller.team!r} can't use model {request.model!r}; "
+                       f"it can use: {', '.join(sorted(allowed))}",
+            "type": "invalid_request_error", "code": "model_not_allowed"}})
+
     # Rate limit right after auth, before anything that costs money or time (DECISIONS.md K).
     estimate = ratelimit.estimate_tokens(payload["messages"])
     decision = await app.state.limiter.check(caller.team, estimate, caller)  # the team's buckets and the key's
@@ -254,10 +264,15 @@ async def chat_completions(
     shadow_route = False
     if route:
         chosen, reason = router.choose(route, payload, estimate)
+        if allowed is not None and chosen not in allowed:
+            # The rules want the upgrade, but this team may not use it: it stays on the default, which the config
+            # guarantees it may use (T4). The reason says so, on the response and on the dashboard.
+            chosen, reason = route.default, "upgrade_not_allowed"
         ROUTE_DECISIONS.labels(caller.team, route.name, chosen, reason).inc()
         route_headers = {"x-gateway-routed-to": chosen, "x-gateway-route-reason": reason}
         targets = CONFIG.models[chosen]
-        shadow_route = router.should_shadow(route, estimate)  # also ask the other model, after answering (P5)
+        # Also ask the other model, after answering (P5), unless the team couldn't use it anyway.
+        shadow_route = router.should_shadow(route, estimate) and (allowed is None or route.other(chosen) in allowed)
     else:
         targets = CONFIG.models.get(request.model)
     # Only configured names become a label: clients can send any string, and each one would be a new time series.

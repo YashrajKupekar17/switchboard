@@ -1078,3 +1078,84 @@ Same runs, final build, success rate while `mock` was broken:
   - per-intent caching from the team's own labels.
 - **Production terms:** *workload characterisation*, *hit rate vs cost reduction*, *verifier cost*, *precision against noisy labels*.
 
+## T. Managing teams and keys
+
+### T0. What's hard about it, and what this section adds
+- **The problem, as platform teams describe it:** storing a key is easy. The pain is everything around it:
+  - attribution ("this team spent $4,000" isn't actionable without knowing on what);
+  - keys outliving the people and services they were made for;
+  - one runaway service spending a whole team's budget;
+  - the platform team as a bottleneck for every change;
+  - spend that overshoots a budget because cost is known only after an answer.
+- **What Phase 3 already had:** hashed keys with a visible prefix, revocation within 60 s, fail-closed auth, a least-privilege database user, an append-only ledger priced by the model that actually answered, and per-team limits and budgets.
+- **Compared with:** LiteLLM's proxy (organisations, teams, users and keys, each with budgets; allowed models per key; an admin UI), Portkey (budgets and limits on keys, metadata for cost reports) and OpenAI's own Projects (project keys, per-project limits). This section adds the pieces that matter most and leaves out the ones that are mostly product surface (T5).
+- **Where each setting lives:** a team's policy (its limits, budget, allowed models) in `config.yaml`, reviewed like code. A key's settings in Postgres with the key, changed by the admin tool without a restart, and reaching every gateway copy within a minute through the key cache.
+
+### T1. Request tags, for attribution
+- **What:** `x-gateway-tags: feature=search,env=prod`, stored with each request's ledger row as `JSONB`, on answers and cache hits alike. `scripts/spend.py` reports a month's spend by team, key, model, deployment or any tag.
+- **Strict, and refused if malformed** (400 `invalid_tags`): at most 10, lowercase names, a restricted character set. Attribution that silently drops requests is worse than none, because nobody notices until the report is wrong. Lowercase names stop "Env" and "env" becoming two columns.
+- **Never metric labels:** clients choose the values, and each new value would be a new Prometheus time series. Reports come from the ledger, where cardinality costs nothing.
+- **Not part of the cache key:** the same question with different tags is the same question.
+- **The report's SQL:** grouping columns come from a whitelist and tag names are query parameters, never text spliced into the query.
+- **Alternatives:** tags in the request body, as LiteLLM's `metadata` does (works, but the OpenAI SDK needs `extra_body`, and a gateway field mixes into the provider's payload); OpenAI's `user` field (one value, meant for end users, not features).
+
+### T2. A key's own limits and budget, inside its team's
+- **What:** `rpm`, `tpm` and `max_usd` columns on the key, `NULL` for "only the team's". A request needs room in every limit that applies, so a key can be tighter than its team, never looser.
+- **Rate limits: every bucket in one atomic script.** The Redis script now takes any number of buckets: the team's two, plus the key's own if it has them. Checking them in separate calls would let a request refused by its key's bucket still take from its team's, or two copies race between the calls. The x-ratelimit headers describe whichever bucket runs out first, since that's the one the client will hit.
+- **Budgets: the same design as the team's.** A Redis running total per key per month, rebuilt from the ledger with a `SUM` by `key_id` (now indexed on `key_id, created_at`). New spend goes to the team's and the key's totals in one script call. The team's budget is checked first, so a key's budget can't let it past its team's.
+- **Money to the micro-dollar:** `max_usd` is `NUMERIC(14, 6)`. The first version used `NUMERIC(12, 2)`, and the real check caught it: a budget of $0.000001 was stored as $0.00 while the audit log recorded what was asked. A migration widens the column.
+- **Errors say whose limit:** "rate limit reached for key sbk_7Jr6vcid (policy check)" or "team 'search' has reached its monthly budget", so the developer knows whether to talk to their team or the platform.
+
+### T3. Key lifecycle: expiry, last use, rotation, audit
+- **Expiry:** an `expires_at` column, checked on every request against the clock, not only when the key is looked up. A key held in the 60 s cache still stops at its expiry time. It gets its own error, `expired_api_key`, rather than "invalid", so the developer knows what happened.
+- **Last use, without a write per request:** each copy remembers the latest time per key in memory and writes them all in one `UPDATE ... FROM unnest(...)` a minute. `GREATEST` keeps a late batch from another copy from moving the time backwards. A failed write keeps its times for the next flush. The gateway's database user can update that one column and nothing else. Accurate to about a minute, which is all "does anything still use this key?" needs.
+- **Rotation with a grace period:** `keys.py rotate ID --grace-hours 24` creates a key with the same team, name, limits and budget, and the old key's *lifetime* (old expiry minus old creation, counted from now). The old key keeps working for the grace period, then expires, never later than it already would have. Both keys work during the overlap, so services move without an outage. It's the standard pattern for credentials (AWS access keys, Stripe's rolling keys). The first version copied the old expiry *date*, which would have made rotating a nearly-expired key pointless; the real check caught it.
+- **Audit log:** `key_audit` records who, what, when and the details for every create, update, rotate and revoke, written in the same transaction as the change, so neither can exist without the other. The gateway has no access to it. "Who" is `SWITCHBOARD_ADMIN` or the login name: honest for a CLI, and the place an SSO identity would go.
+- **Grants are now exact:** `setup_db.py` revokes everything from the gateway user before granting what it lists, in one transaction. Before, it only added grants, so a permission given by mistake would have stayed forever. A mutation test showed it: after one run with a broader grant, the next run still had it.
+
+### T4. Which models a team may use
+- **What:** `access` in `config.yaml`: `"*"` or a list of model and route names, by default and per team. Anything else gets a 403 `model_not_allowed` that lists what the team can use, checked before the rate limit so a refusal uses none of it.
+- **With `auto`:** a team allowed `auto` must be allowed its default (the config refuses to start otherwise, since every ordinary request would be refused). If the rules want the upgrade and the team can't use it, it stays on the default, with `x-gateway-route-reason: upgrade_not_allowed`. Shadow comparisons (P5) are skipped for that team, since it couldn't switch anyway.
+- **By name, not deployment:** access is checked on the name the client asks for. The fallback targets behind a name are the platform's choice.
+- **Per team only, not per key:** that covers "don't use gpt-4o by accident". Per-key lists would be a small step on the same check, when someone needs them.
+
+### T5. What's still missing, compared with production systems
+- **No admin API or UI, and no self-service:** the admin tool is a CLI run as the database owner. The next step would be an admin API with the same operations and audit log, and team leads managing their own keys behind SSO.
+- **No hierarchy:** team, then key. No organisations, projects or users.
+- **Team settings need a restart:** limits, budgets and allowed models live in `config.yaml`. Per-key settings don't.
+- **Budgets can still overshoot:** by at most one request's cost per request in flight (L4). Reserving the worst case (prompt plus `max_tokens`) before the call and settling after would close it, the same estimate-then-settle idea as the token rate limit.
+- **No reconciliation with the provider's invoice:** prices are copied by hand.
+- **Alerts reach the platform team only:** a team owner isn't told by email or Slack.
+
+### T6. Tests and the real check
+- **New tests:**
+  - tags: parsing, storage on answers and hits, refusal before anything is spent, the report's query building;
+  - per-key limits, through the limiter and the gateway, including "a refusal takes nothing from the team";
+  - per-key budgets, rebuilt by key, and the team's budget still winning;
+  - expiry, including a cached key that expires;
+  - last-use batching and its retry;
+  - allowed models, for the config, the 403, and `auto`.
+- **`tests/test_postgres.py`** runs the key store against a real Postgres: create, revoke, rotate, update, the audit trail, batched last-use, per-key ledger totals, and the gateway user's permissions (as `SET ROLE gateway`: it can update `last_used_at` and nothing else, and can't read the audit log). It's skipped without `TEST_DATABASE_URL`, refuses any database not named `*_test`, and CI now runs it with a Postgres 17.5 service.
+- **Mutation checks:**
+  - in the store: a rotation extending an expiry, last use going backwards, a lost failed flush, a broader grant;
+  - in the gateway: ignoring a key's rpm, its budget, its expiry, the 403, and `auto` upgrading anyway;
+  - in the config: not requiring a route's default.
+  Each made a test fail.
+- **Real check** (3 copies, real Postgres, Redis and OpenAI): a key created with 2 rpm and a $0.01 budget got 200, 200, then a 429 naming the key, with the limit shared across all three copies. Its own spend showed in `x-gateway-key-budget-spent-usd` (4 micro-dollars after one request). `last used` appeared within a minute. After lowering its budget to $0.000001, it got a 429 for its own budget once the key cache refreshed. Rotation gave a working new key, and the audit log held all five changes with their actor. `spend.py --by key --by tag:feature` split the three requests by key and tag. The check also caught the two bugs in T2 and T3, which unit tests with fakes had passed.
+
+## U. Accepting what OpenAI accepts
+
+### U1. The promise, and where it broke
+- **The promise:** a team changes `base_url` and nothing else. Writing the developer guide (`docs/USING.md`) against the code found three places where that wasn't true:
+  - **Message `content` had to be a string.** Tool calling across turns sends an assistant message with `content: null` and `tool_calls`, and images send a list of parts. Both were refused with a 422.
+  - **A 1 MB image would have counted as ~250,000 tokens:** the rate-limit estimate counted the base64 text, so it would have been refused as too large.
+  - **Every stream ended with a chunk whose `choices` was empty:** the gateway asks for usage to bill, and passed the chunk on. OpenAI only sends it when asked, and the common `chunk.choices[0].delta.content` crashes on it.
+
+### U2. The fixes
+- **Validate only what the gateway reads.** `content` is a string, a list of parts, or nothing; the rest of the format is the provider's to check, and its 400 reaches the client as-is. The gateway doesn't fall behind when OpenAI's format grows.
+- **The estimate understands parts:** text parts as text, an image as a fixed 765 tokens (1024×1024 at high detail), tool-call arguments as input. The real usage still corrects it afterwards.
+- **Usage is passed on only when asked** (`stream_options.include_usage`), and still read for billing.
+- **Malformed requests get a 400 in OpenAI's shape,** not FastAPI's 422 with `detail`, so SDKs raise `BadRequestError`.
+- **Anthropic targets refuse non-text content,** so another target takes the request rather than a mistranslation reaching Claude.
+- **Tests:** each fix has one, and four mutations (forwarding usage anyway, counting base64 as text, `content: str`, removing the Anthropic guard) were each caught.
+

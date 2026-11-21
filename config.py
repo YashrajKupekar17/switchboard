@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import yaml
@@ -58,6 +58,8 @@ class Config:
     default_cache: CacheSettings
     team_cache: dict[str, CacheSettings]
     routes: dict[str, Route]  # route name ("auto") -> how it picks a model
+    default_models: Optional[frozenset] = None  # names a team may ask for (DECISIONS.md T4); None = any
+    team_models: dict = field(default_factory=dict)  # team -> frozenset of names, overriding the default
     max_connections: int = 1000  # to all providers together, per gateway copy (DECISIONS.md Q2)
     max_connections_per_provider: int = 600  # one provider's share of them (R2)
     slow_call_s: float = 10.0  # an answer that made us wait longer counts as a failure for the breaker (R3); 0 = off
@@ -71,6 +73,10 @@ class Config:
 
     def cache_for(self, team: str) -> CacheSettings:
         return self.team_cache.get(team, self.default_cache)
+
+    def models_for(self, team: str) -> Optional[frozenset]:
+        """The model and route names this team may ask for, or None for any."""
+        return self.team_models.get(team, self.default_models)
 
 
 def _yaml_modes(cache: dict) -> dict:
@@ -162,6 +168,25 @@ def load_config(path: str) -> Config:
     if not isinstance(overload_target_ms, int) or overload_target_ms < 0:
         raise RuntimeError(f"overload_target_ms must be a whole number of milliseconds (0 = off), got {overload_target_ms!r}")
 
+    access = raw.get("access") or {}
+
+    def allowed(where: str, names) -> Optional[frozenset]:
+        if names in (None, "*"):
+            return None
+        if not isinstance(names, list) or not names:
+            raise RuntimeError(f"access for {where!r}: models must be \"*\" or a list of names")
+        unknown = [n for n in names if n not in models and n not in routes]
+        if unknown:
+            raise RuntimeError(f"access for {where!r}: {', '.join(unknown)} isn't a model or route under `models`/`routes`")
+        for name in names:
+            if name in routes and routes[name].default not in names:
+                # The route would pick a model the team may not use, on every ordinary request.
+                raise RuntimeError(f"access for {where!r}: route {name!r} needs its default, {routes[name].default!r}")
+        return frozenset(names)
+
+    default_models = allowed("default", (access.get("default") or {}).get("models"))
+    team_models = {team: allowed(team, (v or {}).get("models")) for team, v in (access.get("teams") or {}).items()}
+
     rl = raw.get("rate_limits", {})
     default = rl.get("default", {"rpm": 60, "tpm": 100_000})
     return Config(
@@ -176,6 +201,8 @@ def load_config(path: str) -> Config:
         default_cache=CacheSettings(**default_cache),
         team_cache=team_cache,
         routes=routes,
+        default_models=default_models,
+        team_models=team_models,
         max_connections=max_connections,
         max_connections_per_provider=per_provider,
         slow_call_s=slow_call_s,

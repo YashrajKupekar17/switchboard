@@ -62,6 +62,8 @@ Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven
 
 **Team API keys.** Each team gets its own `sbk_...` key and sends it the same way as an OpenAI key. Postgres stores only a SHA-256 hash of each key, so a leaked copy of the table can't be used to make requests. Each gateway copy caches lookups in memory (valid keys for 60 s, invalid ones for 10 s), so almost every request is checked without a database query. If Postgres is down, keys that aren't already cached are rejected rather than let through.
 
+**Managing keys and teams.** A key can carry its own limits, monthly budget and expiry date, inside its team's, so one runaway service can't spend the whole team's budget. Keys are rotated with a grace period, so the old and new keys overlap while services redeploy. Each key's last use is recorded (in one batched write a minute, not one per request), so dead keys can be found. Every admin change is written to an audit log in the same transaction as the change. Each team can be limited to certain models, so `gpt-4o` isn't used by accident. Requests can carry tags (`x-gateway-tags: feature=search`), and `scripts/spend.py` splits spend by team, key, model or tag. `scripts/keys.py` is the admin tool: create, list, rotate, set, revoke, audit.
+
 **Rate limits per team.** Each team has two token buckets in Redis, shared by every gateway copy: requests per minute and tokens per minute. Before calling a provider, the gateway takes a rough guess of the prompt's tokens; when the answer is done, it charges the real number from the provider's usage report. A team over its limit gets a 429 shaped like OpenAI's, with `Retry-After`, so the OpenAI SDK waits and retries on its own. If Redis goes down, requests keep flowing: each gateway copy enforces its share of the limit by itself until Redis is back.
 
 **Monthly budgets per team.** Every request is priced by the model that actually answered: input, cached input, cache writes and output each at their own price, from a table in `config.yaml`. Money is kept as whole micro-dollars, never floats. Each request is written to an append-only ledger in Postgres, and Redis keeps a running total per team so the check before each request is a single lookup. A team past its `soft_usd` gets a warning and an alert; at `max_usd` its requests get a 429 until the month resets. If Redis is down, the check is skipped, but spending is still recorded.
@@ -182,6 +184,9 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 5a: `auto` routing by rules (a router, not a cascade: DECISIONS.md P)
 - [x] Phase 5b: shadow mode for the router, with a pairwise judge (scripts/route_eval.py)
 - [x] Phase 6: mock provider, load tests with k6, published numbers, load shedding, chaos test (DECISIONS.md Q, R)
+- [x] Cache savings on a replayed workload (DECISIONS.md S)
+- [x] Managing teams and keys: tags, per-key limits and budgets, expiry, rotation, audit log, allowed models (DECISIONS.md T)
+- [x] Accepting every message shape OpenAI does: images, tool calls across turns (DECISIONS.md U)
 
 ## Docs
 
