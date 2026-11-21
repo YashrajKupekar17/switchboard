@@ -18,14 +18,25 @@ services:
     image: switchboard:dev  # already has Starlette and uvicorn
     command: ["uvicorn", "--app-dir", "/loadtest", "mock_provider:app", "--host", "0.0.0.0", "--port", "9000",
               "--workers", "4", "--log-level", "warning"]
-    volumes:
-      - ./loadtest:/loadtest:ro
     environment:
       MOCK_TTFT_MS: ${MOCK_TTFT_MS:-300}
       MOCK_TOKENS: ${MOCK_TOKENS:-40}
       MOCK_TOKENS_PER_S: ${MOCK_TOKENS_PER_S:-50}
       MOCK_ERROR_RATE: ${MOCK_ERROR_RATE:-0}
+      MOCK_CONTROL: /state/mock.json  # written by chaos.sh to break this mock mid-run
+    volumes:
+      - ./loadtest:/loadtest:ro
+      - ./loadtest/results:/state:ro
     healthcheck:  # the image's own check asks port 8000
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=2)"]
+
+  mock-b:  # the fallback provider for the chaos test; chaos.sh never breaks it
+    image: switchboard:dev
+    command: ["uvicorn", "--app-dir", "/loadtest", "mock_provider:app", "--host", "0.0.0.0", "--port", "9000",
+              "--workers", "4", "--log-level", "warning"]
+    volumes:
+      - ./loadtest:/loadtest:ro
+    healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=2)"]
 
   k6:

@@ -29,7 +29,7 @@ from config import load_config
 from transport import AiohttpTransport
 from metrics import (ATTEMPTS, CACHE_LOOKUPS, CACHE_SAVED, CACHE_STORED, FALLBACKS, RATE_LIMITED, ROUTE_DECISIONS,
                      ROUTE_SHADOW, ROUTE_SHADOW_USD, SEMANTIC_LOOKUPS, SEMANTIC_SIMILARITY, RequestMetrics)
-from upstream import FINAL_STATUS, POOL_WAIT, RETRYABLE, Failure, call_target
+from upstream import FINAL_STATUS, NOT_ITS_FAULT, POOL_WAIT, RETRYABLE, Failure, call_target
 
 load_dotenv()  # reads .env into os.environ (real env vars win if both are set)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -60,7 +60,7 @@ def open_http() -> httpx.AsyncClient:
     # One shared client for the whole app = one connection pool, reused by every request. httpx's interface on
     # aiohttp's pool: httpcore's own pool used 88% of the CPU under load (DECISIONS.md Q3). Its size caps how
     # many provider calls this copy can have open at once (Q2).
-    return httpx.AsyncClient(transport=AiohttpTransport(CONFIG.max_connections))
+    return httpx.AsyncClient(transport=AiohttpTransport(CONFIG.max_connections, CONFIG.max_connections_per_provider))
 
 
 async def open_key_store():
@@ -318,19 +318,20 @@ async def chat_completions(
                 break
 
             result = None
+            waits = []
             try:
                 result = await call_target(
                     app.state.http, target, payload, request.stream, on_usage=lambda u, t=target: settle(t, u),
                     on_complete=(lambda b, t=target: completed(t, b)) if (caching.enabled or shadow_route) and i == 0
                     else None,
+                    on_waited=waits.append,
                 )
             finally:
                 if result is None:  # cancelled or crashed before the provider gave a verdict
                     breaker.release(permit)
 
             if not isinstance(result, Failure):
-                breaker.record_success(permit)  # any real answer (even a 400) proves the provider is up
-                ATTEMPTS.labels(target.deployment, "ok").inc()
+                ATTEMPTS.labels(target.deployment, _judge(breaker, permit, target, waits)).inc()
                 if i > 0:
                     FALLBACKS.labels(request.model).inc()
                 log.info("route team=%s model=%s -> %s/%s", caller.team, request.model, target.provider.name, target.model)
@@ -344,8 +345,10 @@ async def chat_completions(
 
             ATTEMPTS.labels(target.deployment, result.kind).inc()
             failures.append((target, result))
-            if result.kind == "unsupported":
-                breaker.release(permit)  # never reached the provider: says nothing about its health
+            if result.kind in ("unsupported", "provider_full"):
+                # Never reached the provider (unsupported), or it has its share of our connections (R2): says
+                # nothing about its health. Another target may handle it.
+                breaker.release(permit)
                 break
             if result.kind == "overloaded":
                 # This copy is full, not the provider broken (Q2): leave its breaker alone, and don't fall back,
@@ -407,19 +410,21 @@ async def _shadow_route(team: str, route: router.Route, served: str, reason: str
     answer = {}
     shadow_payload = {k: v for k, v in payload.items() if k not in ("stream", "stream_options")}
     result = None
+    waits = []
     try:
-        result = await call_target(app.state.http, target, shadow_payload, False, on_complete=answer.update)
+        result = await call_target(app.state.http, target, shadow_payload, False, on_complete=answer.update,
+                                   on_waited=waits.append)
     finally:
         if result is None:
             breaker.release(permit)
     if isinstance(result, Failure):
-        if result.kind == "unsupported":
-            breaker.release(permit)  # never reached the provider
+        if result.kind in NOT_ITS_FAULT:
+            breaker.release(permit)
         else:
             breaker.record_failure(permit)
         ROUTE_SHADOW.labels(team, "failed").inc()
         return
-    breaker.record_success(permit)
+    _judge(breaker, permit, target, waits)
     if not cache.storable(answer):  # cut off, filtered or an error: not a fair comparison
         ROUTE_SHADOW.labels(team, "failed").inc()
         return
@@ -513,17 +518,29 @@ def _attempts(failures: list) -> str:
     return ", ".join(f"{t.provider.name}:{f.kind}" for t, f in failures)
 
 
+def _judge(breaker, permit, target, waits: list) -> str:
+    """A provider answered. Any real answer (even a 400) proves it's up, unless it made us wait so long that more
+    traffic shouldn't go there: then it counts as a failure, though this client still gets the answer (R3).
+    Returns the outcome for the attempts metric."""
+    if CONFIG.slow_call_s and waits and waits[-1] > CONFIG.slow_call_s:
+        log.warning("slow answer from %s/%s: waited %.1fs", target.provider.name, target.model, waits[-1])
+        breaker.record_failure(permit)
+        return "slow"
+    breaker.record_success(permit)
+    return "ok"
+
+
 def _all_failed(model: str, failures: list) -> JSONResponse:
     # A real provider failure outranks "unsupported": a 400 would wrongly blame the client.
     last = next((f for _, f in reversed(failures) if f.kind != "unsupported"), failures[-1][1])
     headers = {"x-gateway-attempts": _attempts(failures)}
-    if last.kind in ("rate_limit", "circuit_open", "overloaded"):
+    if last.kind in ("rate_limit", "circuit_open", "overloaded", "provider_full"):
         headers["Retry-After"] = last.retry_after or "1"
     unsupported = last.kind == "unsupported"
     message, kind = f"all providers failed for model {model!r}", "upstream_error"
     if unsupported:
         message, kind = last.detail, "invalid_request_error"
-    elif last.kind == "overloaded":
+    elif last.kind in ("overloaded", "provider_full"):
         message, kind = "this gateway copy is at capacity, retry shortly", "gateway_overloaded"
     return JSONResponse(
         status_code=FINAL_STATUS[last.kind],

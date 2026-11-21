@@ -122,6 +122,13 @@ cache:
 # requests/s x seconds per answer (Little's Law): 200/s x 5 s = 1,000. When all are busy, a request waits up to
 # 1 s for one, then gets 503 gateway_overloaded; that's our limit, so the provider's breaker isn't touched (Q2).
 max_connections: 1000
+# One provider's share of those (a bulkhead, DECISIONS.md R2). A provider that turns slow holds its connections for
+# as long as it's slow; past its share, requests go to the next target at once instead of waiting.
+max_connections_per_provider: 600
+# An answer that made us wait longer than this (to the first token, or for a whole answer, less 50 ms per output
+# token for writing it) counts as a failure for the provider's breaker, though the client still gets it (R3).
+# Five in a row and traffic moves to the fallback. 0 turns it off.
+slow_call_s: 10
 # Load shedding (Q5): if, for 100 ms, even the fastest request spent longer than this in the gateway's own part
 # (before calling the provider), the next 100 ms of chat requests get 503 at once. Normally that part takes 1-3 ms.
 # 0 turns it off.

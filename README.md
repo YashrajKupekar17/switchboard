@@ -110,6 +110,21 @@ What the tests found:
 
 DECISIONS.md section Q has the method, the profiles, the dead ends, and the full results. To run them yourself, see `loadtest/run.sh`.
 
+**Chaos tested.** At 100 requests/s, the first-choice provider was broken for a minute while a second one stood by as the fallback:
+
+| How it broke | Requests that succeeded during the outage |
+|---|---|
+| Container killed | 100% |
+| Every request gets a 500 | 100% |
+| 20 s to answer, but still answering | 100% (was 60%) |
+| Killed, streamed | 99.1%: streams already sending tokens can't move to another provider |
+
+The slow provider was the one that broke things. A 20 s answer is under the timeout, so it counted as a success, and it held connections twenty times longer. It took the whole connection pool, and the gateway started refusing requests while the fallback sat idle. Two fixes:
+- Each provider can use at most 600 of the 1,000 connections. Past that, requests go straight to the next provider.
+- An answer that kept us waiting more than 10 s counts as a failure for the breaker, so traffic moves to the fallback after five of them.
+
+DECISIONS.md section R has the details; `loadtest/chaos.sh` runs it.
+
 ## Running it
 
 You need Docker and an OpenAI API key. Python 3.9 or newer is only needed for the scripts and tests.
@@ -149,7 +164,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 - [x] Phase 4: exact caching, semantic caching (embedding + LLM judge) with shadow mode and an evaluation script
 - [x] Phase 5a: `auto` routing by rules (a router, not a cascade: DECISIONS.md P)
 - [x] Phase 5b: shadow mode for the router, with a pairwise judge (scripts/route_eval.py)
-- [x] Phase 6: mock provider, load tests with k6, published numbers, load shedding (DECISIONS.md Q)
+- [x] Phase 6: mock provider, load tests with k6, published numbers, load shedding, chaos test (DECISIONS.md Q, R)
 
 ## Docs
 

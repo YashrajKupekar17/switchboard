@@ -23,6 +23,7 @@ from anthropic_adapter import StreamError, Unsupported
 from cache import assemble
 from config import Target
 from metrics import ATTEMPTS, TPOT, TTFT, record_usage
+from transport import ProviderFull
 
 log = logging.getLogger("gateway")
 
@@ -35,6 +36,14 @@ FIRST_CHUNK_TIMEOUT = 10.0  # seconds to wait for a stream's first chunk; until 
 
 # Failure kinds that are safe to retry: the provider either never got the request or failed fast.
 RETRYABLE = {"server", "connect"}
+# Failure kinds that never reached the provider, or are our own limit: they say nothing about its health, so they
+# never count against its breaker.
+NOT_ITS_FAULT = {"unsupported", "overloaded", "provider_full"}
+
+# How long a provider made us wait, for the slow-call check (DECISIONS.md R3). For a stream, until its first
+# chunk. A non-streamed answer arrives all at once, so we take the whole time and allow this much per output token
+# for writing it: 20 tokens/s, slower than any model we route to. What's left is time spent waiting to start.
+WRITING_S_PER_TOKEN = 0.05
 
 # What the client gets when every target failed, keyed by the last failure's kind.
 FINAL_STATUS = {
@@ -42,13 +51,14 @@ FINAL_STATUS = {
     "circuit_open": 503,  # we skipped it ourselves; Retry-After says when the next trial is
     "unsupported": 400,  # no target could handle the request's features (e.g. tools on an Anthropic-only model)
     "overloaded": 503,  # no free connection in this copy: our limit, not the provider's
+    "provider_full": 503,  # this provider has its share of our connections (R2), and no other target could take it
 }
 
 
 @dataclass
 class Failure:
     kind: str  # "auth" | "config" | "rate_limit" | "server" | "connect" | "network" | "timeout" | "circuit_open"
-    #            "unsupported" | "overloaded"
+    #            "unsupported" | "overloaded" | "provider_full"
     detail: str
     retry_after: Optional[str] = None
 
@@ -67,6 +77,9 @@ def classify_status(status: int) -> Optional[str]:
 
 
 def classify_exception(exc: Exception) -> Failure:
+    if isinstance(exc, ProviderFull):
+        # Our cap on this one provider (R2). Another provider may have room, so the caller falls back.
+        return Failure("provider_full", repr(exc), retry_after="1")
     if isinstance(exc, httpx.PoolTimeout):
         # Every connection in our pool was busy. The provider never saw the request and may be perfectly fine:
         # blaming it would open its breaker and turn our overload into an outage (DECISIONS.md Q2).
@@ -80,18 +93,29 @@ def classify_exception(exc: Exception) -> Failure:
 
 UsageCallback = Callable[[Optional[dict]], None]
 CompleteCallback = Optional[Callable[[dict], None]]  # gets the whole answer, OpenAI format, if it finished cleanly
+WaitedCallback = Callable[[float], None]  # gets the seconds the provider made us wait (WRITING_S_PER_TOKEN)
 
 
 def _ignore_usage(usage: Optional[dict]) -> None:
     pass
 
 
+def _ignore_waited(seconds: float) -> None:
+    pass
+
+
+def waited(seconds: float, usage: Optional[dict]) -> float:
+    """For a non-streamed answer: its time, less what writing its tokens is allowed to take."""
+    return seconds - ((usage or {}).get("completion_tokens") or 0) * WRITING_S_PER_TOKEN
+
+
 async def call_target(
     http: httpx.AsyncClient, target: Target, payload: dict, stream: bool, on_usage: UsageCallback = _ignore_usage,
-    on_complete: CompleteCallback = None,
+    on_complete: CompleteCallback = None, on_waited: WaitedCallback = _ignore_waited,
 ) -> Union[Response, Failure]:
     """on_usage gets the provider's usage report once the answer is complete (None if it never arrived).
-    on_complete gets the whole answer, only if it finished cleanly; for a stream that means [DONE] arrived."""
+    on_complete gets the whole answer, only if it finished cleanly; for a stream that means [DONE] arrived.
+    on_waited gets how long the provider made us wait, before this returns, for answers that arrived."""
     payload = {**payload, "model": target.model}  # the provider's own name for the model
     headers = {"x-gateway-provider": target.provider.name}
     is_anthropic = target.provider.type == "anthropic"
@@ -103,8 +127,9 @@ async def call_target(
         if dropped:
             headers["x-gateway-dropped-params"] = ",".join(dropped)  # tell the client, don't hide it
     if stream:
-        return await _call_stream(http, target, payload, headers, on_usage, on_complete)
+        return await _call_stream(http, target, payload, headers, on_usage, on_complete, on_waited)
 
+    started = time.perf_counter()
     try:
         upstream = await http.post(
             target.provider.chat_url, headers=target.provider.headers(), json=payload, timeout=NON_STREAM_TIMEOUT
@@ -120,6 +145,7 @@ async def call_target(
             anthropic_adapter.error_to_openai(upstream.content))
     else:
         body = upstream.json()
+    on_waited(waited(time.perf_counter() - started, body.get("usage") if upstream.is_success else None))
     if upstream.is_success:
         record_usage(target.deployment, body.get("usage"))
         on_usage(body.get("usage"))
@@ -130,7 +156,7 @@ async def call_target(
 
 async def _call_stream(
     http: httpx.AsyncClient, target: Target, payload: dict, headers: dict, on_usage: UsageCallback,
-    on_complete: CompleteCallback,
+    on_complete: CompleteCallback, on_waited: WaitedCallback,
 ):
     started = time.perf_counter()
     try:
@@ -155,6 +181,7 @@ async def _call_stream(
         return JSONResponse(status_code=upstream.status_code, content=content, headers=headers)
 
     # First chunk is in hand: only now do we commit to this provider and send 200 to the client.
+    on_waited(time.perf_counter() - started)
     lines, buffered = first
     return StreamingResponse(
         relay_stream(_replay(buffered, lines), started, target.deployment, on_usage, on_complete),

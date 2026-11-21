@@ -901,7 +901,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **Fix:**
   - **`max_connections` in `config.yaml`, default 1,000**, sized by Little's Law (200 RPS × 5 s answers = 1,000). There is still a limit: without one, a provider that slows down lets connections pile up until the copy runs out of memory.
   - **A full pool is our overload, not the provider's failure:** a new failure kind, `overloaded`. It leaves the breaker alone, doesn't fall back (every target shares the same pool), waits 1 s at most instead of 5, and returns **503 `gateway_overloaded` with `Retry-After: 1`**, so the client can retry, likely on another copy.
-- **Not done: one pool per provider** (*bulkhead*). The pool is shared, so one slow provider can still take every connection and starve the healthy ones.
+- **Not done here: one pool per provider** (*bulkhead*). The pool was shared, so one slow provider could take every connection and starve the healthy ones. The chaos test showed exactly that, and R2 added it.
 - **Production terms:** *Little's Law*, *cascading failure*, *bulkhead*. The general lesson: a breaker must only count failures that are the dependency's fault.
 
 ### Q3. httpcore's pool used 88% of the CPU: aiohttp underneath, httpx on top
@@ -958,8 +958,72 @@ One copy, one CPU, final build. "+" is over the mock alone (non-streamed p50 1,0
 - **Before the fixes (same setup):** 75 RPS was the most a copy could do without errors. At 100 RPS, p99 was 8.3 s. At 150 RPS, 3,805 of 4,500 requests failed.
 
 ### Q7. What's not measured yet
-- **Provider failures under load:** the mock failing 20% of requests (breaker and fallback under load), and a provider slowing to 10 s (in flight grows 10×: does `max_connections` hold?). `MOCK_ERROR_RATE` and `MOCK_TTFT_MS` are there for it.
+- ~~**Provider failures under load**~~: done in section R. A slow provider did break things.
 - **Redis or Postgres going down mid-run.**
 - **Three copies behind nginx**, and nginx's own cost.
 - **The semantic cache**, which needs a mock embeddings endpoint.
 - **The ~40 ms that comes and goes at 50-150 RPS** (Q6).
+
+## R. Chaos testing: a provider failing under load
+
+### R1. The test, and what it found
+- **Setup:** the load-test stack (one copy, one CPU) plus a second mock, `mock-b`. Model `mock-ha` tries `mock` first and falls back to `mock-b`. k6 sends 100 requests/s for 3 minutes; `mock` breaks at 1:00 and recovers at 2:00. `loadtest/chaos.sh` runs it, and `chaos_report.py` prints what clients saw in 5-second steps.
+- **Three ways to break it**, because providers fail in more ways than "down":
+  - **kill:** `docker kill` on the mock's container. Connections in use are cut, and new ones can't be made.
+  - **errors:** every request gets a 500.
+  - **slow:** 20 s to the first token, still answering.
+  - errors and slow are switched on through a small JSON file the mock re-reads twice a second. Not an HTTP endpoint: the mock has 4 worker processes, and a call would only reach one.
+- **Before any fix** (success rate while `mock` was broken):
+
+| Scenario | Success | What went wrong |
+|---|---|---|
+| kill | 100% | nothing. The 97 requests waiting on `mock` when it died fell back to `mock-b` and took 2.2 s instead of 1.1 s |
+| kill, streamed | 99.1% | 71 streams already sending tokens were cut off, the one thing a gateway can't save |
+| errors | 99.5% | 33 requests shed in one short burst |
+| slow | **60%** | 2,052 requests got 503, and none went to `mock-b` |
+
+- **Why slow broke it:**
+  1. A 20 s answer is under the 60 s read timeout, so it counts as a success. No fallback, and the breaker never counts a failure.
+  2. Little's Law: 100 requests/s × 21 s = 2,100 in flight, and the pool has 1,000. Once it filled, requests got 503 `gateway_overloaded`.
+  3. Both providers share the pool, so the healthy one sat idle while the slow one held every connection.
+- **The lesson:** a provider that's down is easy. Errors and dropped connections are caught by the rules from Phase 2. A provider that is slow but still answering looks healthy to every rule we had. Lowering the timeout doesn't fix it: a long answer can take 30-60 s, so a timeout can't tell slow from stuck.
+
+### R2. Each provider gets at most 600 of the 1,000 connections (a bulkhead)
+- **What:** `max_connections_per_provider` in `config.yaml` (default 60% of `max_connections`). When a provider has that many requests open, the next request to it fails at once with a new kind, `provider_full`, and the gateway moves on to the next target. It never counts against the provider's breaker: it's our cap, not its fault. If no target has room, the client gets 503 `gateway_overloaded` with `Retry-After: 1`.
+- **Where:** in `transport.py`, next to the total limit, counted per host and port. The transport already holds a request's connection until the response is closed, for a stream that's the whole stream, so the count is right without the gateway tracking anything.
+- **No waiting:** the total limit waits up to 1 s for a free connection; the per-provider limit doesn't wait at all. There's somewhere else to go, and waiting on a slow provider is what we're avoiding.
+- **Why 600:** it leaves 400 connections for the other providers. One provider alone can still use 600, which at 1.08 s per answer is ~550 requests/s, above what one copy's CPU can serve (Q6), so a single-provider model loses nothing.
+- **Alternatives:** separate pools per provider, each sized in the config (same effect, more to configure and get wrong); a weighted share per provider (not needed with 2-4 providers).
+- **Production terms:** *bulkhead*, from ship hulls split into compartments so one leak doesn't sink the ship.
+
+### R3. A slow answer counts as a failure for the breaker
+- **What:** if a provider made us wait more than `slow_call_s` (10 s), its breaker records a failure, though the client still gets that answer. Five in a row and the breaker opens, so traffic goes to the fallback until a trial request comes back fast. On the dashboard it shows as outcome `slow`.
+- **"Made us wait":** for a stream, the time to its first chunk. A non-streamed answer arrives all at once, so we can't see when it started. We take its whole time and allow 50 ms per output token for writing it (20 tokens/s, slower than any model we route to). 20 s for 40 tokens is 18 s of waiting: slow. 40 s for 1,000 tokens is a provider writing a lot: not slow.
+- **Why not a timeout:** a timeout throws away an answer that was coming. This keeps the answer and stops sending more traffic there.
+- **Where it comes from:** Resilience4j's breaker has the same idea (`slowCallDurationThreshold`). Ours counts slow calls in the same run of consecutive failures as errors, not as a rate over a window, to keep one rule.
+- **Limits:**
+  - The breaker only learns once slow answers finish, about 20 s in. The bulkhead (R2) is what protects those first 20 s.
+  - One value for every provider. A local model on a CPU (Ollama) can be slower than 20 tokens/s and would look slow; raise `slow_call_s` or set it to 0 for such a setup.
+- **Not done: hedged requests**, sending a second copy to the fallback after a few seconds and using whichever answers first (Google's "The Tail at Scale"). It's the strongest fix for slow tails, and it can double the cost of exactly the requests that are already expensive.
+- **Also fixed:** the shadow call for auto routing (P5) counted a full pool as the provider's failure, Q2's bug in a second place. It now ignores every failure kind that isn't the provider's fault (`NOT_ITS_FAULT` in `upstream.py`).
+
+### R4. Results after the fixes
+Same runs, final build, success rate while `mock` was broken:
+
+| Scenario | Success | Notes |
+|---|---|---|
+| kill | 100% (6,021 requests) | breaker open within 1 s |
+| errors | 100% (6,010) | breaker open after 2 s |
+| slow | **100%** (5,493), was 60% | 620 requests waited ~21 s: the bulkhead let ~600 in, then sent the rest to `mock-b` at once. The breaker opened 21 s in, when the first slow answers came back. p50 1.1 s, p99 20.8 s |
+| kill, streamed | 99.1% | not re-run; the fixes don't change it. A stream that has started can't move to another provider, so the client has to retry |
+
+- **Recovery is slower than it could be:** trials go every 30 s. If one lands while `mock` is still restarting, or still slow, the breaker waits another 30 s. Traffic stayed on `mock-b` for 30-40 s after `mock` was healthy, which is fine while the fallback has room.
+- **Seen, not explained yet:**
+  - Requests shed with nothing overloaded: in the first second after the gateway starts (11-79 requests), once mid-run (33), and around the kill in the streamed run (~50). They didn't appear in the final kill and errors runs.
+  - In the slow run, k6 sent only ~50-70 requests/s for the first 10 s of the outage. It had 200 virtual users ready, and 21 s answers need 2,100, so it was starting more while requests waited. The bulkhead was tested at that lower rate.
+- **Testing:**
+  - Transport test: a provider at its share is refused at once while another provider still works, and its connection comes back afterwards.
+  - Gateway tests: `provider_full` falls back and never trips the breaker, and the only target being full returns 503.
+  - Slow answers, streamed and not, are served but open the breaker after 5. Unit test: a long answer isn't a slow one.
+  - Three mutations, one per new piece of logic, were each caught.
+

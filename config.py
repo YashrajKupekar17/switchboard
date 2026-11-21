@@ -59,6 +59,8 @@ class Config:
     team_cache: dict[str, CacheSettings]
     routes: dict[str, Route]  # route name ("auto") -> how it picks a model
     max_connections: int = 1000  # to all providers together, per gateway copy (DECISIONS.md Q2)
+    max_connections_per_provider: int = 600  # one provider's share of them (R2)
+    slow_call_s: float = 10.0  # an answer that made us wait longer counts as a failure for the breaker (R3); 0 = off
     overload_target_ms: int = 100  # gateway time that means a queue: new chat requests get 503 (Q5); 0 = never
 
     def limits_for(self, team: str) -> Limits:
@@ -147,6 +149,15 @@ def load_config(path: str) -> Config:
     if not isinstance(max_connections, int) or max_connections < 1:
         raise RuntimeError(f"max_connections must be a whole number above 0, got {max_connections!r}")
 
+    per_provider = raw.get("max_connections_per_provider", max_connections * 6 // 10)
+    if not isinstance(per_provider, int) or not 1 <= per_provider <= max_connections:
+        raise RuntimeError(f"max_connections_per_provider must be a whole number from 1 to max_connections "
+                           f"({max_connections}), got {per_provider!r}")
+
+    slow_call_s = raw.get("slow_call_s", 10)
+    if not isinstance(slow_call_s, (int, float)) or slow_call_s < 0:
+        raise RuntimeError(f"slow_call_s must be a number of seconds (0 = off), got {slow_call_s!r}")
+
     overload_target_ms = raw.get("overload_target_ms", 100)
     if not isinstance(overload_target_ms, int) or overload_target_ms < 0:
         raise RuntimeError(f"overload_target_ms must be a whole number of milliseconds (0 = off), got {overload_target_ms!r}")
@@ -166,5 +177,7 @@ def load_config(path: str) -> Config:
         team_cache=team_cache,
         routes=routes,
         max_connections=max_connections,
+        max_connections_per_provider=per_provider,
+        slow_call_s=slow_call_s,
         overload_target_ms=overload_target_ms,
     )

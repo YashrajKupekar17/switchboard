@@ -24,7 +24,7 @@ IN_FLIGHT = Gauge("gateway_requests_in_flight", "Chat requests being handled rig
 
 # --- gateway-specific: problems the client-facing numbers hide ---
 ATTEMPTS = Counter(
-    "gateway_upstream_attempts_total", "Calls to providers, by result (ok, or the failure kind)",
+    "gateway_upstream_attempts_total", "Calls to providers, by result (ok, slow, or the failure kind)",
     ["deployment", "outcome"],
 )
 FALLBACKS = Counter("gateway_fallbacks_total", "Requests answered by a target other than the first", ["model"])

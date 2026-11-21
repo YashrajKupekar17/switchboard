@@ -1,17 +1,25 @@
-# Gateway config for load tests (DECISIONS.md Q): one provider, the mock, so no test ever reaches a real one.
+# Gateway config for load tests (DECISIONS.md Q): only mock providers, so no test ever reaches a real one.
 # Limits and budgets are far above anything a test sends: we're measuring the gateway's work, not watching it refuse.
 
 providers:
   mock:
     base_url: http://mock:9000/v1  # no api_key_env: the mock takes no key
+  mock-b:
+    base_url: http://mock-b:9000/v1  # the fallback, for the chaos test (chaos.sh breaks `mock`)
 
 models:
   mock:
     - provider: mock
       model: mock-model
+  mock-ha:
+    - provider: mock
+      model: mock-model
+    - provider: mock-b
+      model: mock-model
 
 prices:
-  mock/mock-model: {input: 0.15, output: 0.60}  # gpt-4o-mini's, so budgets and the ledger do the same work as in real use
+  mock/mock-model: {input: 0.15, output: 0.60}
+  mock-b/mock-model: {input: 0.15, output: 0.60}  # gpt-4o-mini's, so budgets and the ledger do the same work as in real use
 
 rate_limits:
   default: {rpm: 10000000, tpm: 10000000000}

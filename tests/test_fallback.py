@@ -6,6 +6,7 @@ import pytest
 import respx
 
 import upstream
+from transport import ProviderFull
 from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, FAKE_SSE, OLLAMA_URL, OPENAI_URL
 
 OFF = {"x-gateway-fallback": "off"}
@@ -194,6 +195,30 @@ def test_provider_404_is_our_config_error_so_it_falls_back(client):
 
 
 # --- our own overload (DECISIONS.md Q2) ---
+
+
+@respx.mock
+def test_provider_at_its_connection_share_falls_back_at_once(client):
+    openai = respx.post(OPENAI_URL).mock(side_effect=ProviderFull(""))
+    respx.post(OLLAMA_URL).mock(return_value=ok())
+
+    resp = client.post("/v1/chat/completions", json=CHAT_BODY)
+
+    assert resp.status_code == 200
+    assert resp.headers["x-gateway-provider"] == "ollama"  # the other provider has its own share (R2)
+    assert resp.headers["x-gateway-attempts"] == "openai:provider_full"
+    assert openai.call_count == 1  # never retried
+
+
+@respx.mock
+def test_only_target_at_its_connection_share_is_503_retry_shortly(client):
+    respx.post(OLLAMA_URL).mock(side_effect=ProviderFull(""))
+
+    resp = client.post("/v1/chat/completions", json={**CHAT_BODY, "model": "local-small"})
+
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "1"
+    assert resp.json()["error"]["type"] == "gateway_overloaded"
 
 
 @respx.mock

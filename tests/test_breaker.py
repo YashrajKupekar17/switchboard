@@ -1,10 +1,15 @@
 """Phase 2c: circuit breaker. Unit tests for the state machine, then end-to-end through the gateway."""
+import dataclasses
+
 import httpx
 import pytest
 import respx
 
+import main
+import upstream
 from breaker import CLOSED, HALF_OPEN, NORMAL, OPEN, TRIAL, Breakers, CircuitBreaker
-from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, OLLAMA_URL, OPENAI_URL
+from tests.test_gateway import CHAT_BODY, FAKE_COMPLETION, FAKE_SSE, OLLAMA_URL, OPENAI_URL
+from transport import ProviderFull
 
 
 class FakeClock:
@@ -179,3 +184,49 @@ def test_our_full_connection_pool_never_trips_the_providers_breaker(gw):
     resp = gw.post("/v1/chat/completions", json=CHAT_BODY)
 
     assert resp.headers["x-gateway-provider"] == "openai"  # the breaker is still closed
+
+
+@respx.mock
+def test_a_provider_at_its_connection_share_never_trips_its_breaker(gw):
+    openai = respx.post(OPENAI_URL).mock(side_effect=ProviderFull(""))
+    respx.post(OLLAMA_URL).mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+    for _ in range(10):
+        gw.post("/v1/chat/completions", json=CHAT_BODY)
+    openai.mock(return_value=httpx.Response(200, json=FAKE_COMPLETION))
+
+    resp = gw.post("/v1/chat/completions", json=CHAT_BODY)
+
+    assert resp.headers["x-gateway-provider"] == "openai"  # our cap, not its fault: the breaker is still closed
+
+
+# --- slow answers (DECISIONS.md R3) ---
+
+
+@pytest.fixture
+def every_answer_slow(monkeypatch):
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(main.CONFIG, slow_call_s=1e-9))
+    monkeypatch.setattr(upstream, "WRITING_S_PER_TOKEN", 0)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@respx.mock
+def test_slow_answers_reach_the_client_but_trip_the_breaker(gw, every_answer_slow, stream):
+    body = {"content": FAKE_SSE, "headers": {"content-type": "text/event-stream"}} if stream else {"json": FAKE_COMPLETION}
+    openai = respx.post(OPENAI_URL).mock(return_value=httpx.Response(200, **body))
+    respx.post(OLLAMA_URL).mock(return_value=httpx.Response(200, **body))
+
+    slow = [gw.post("/v1/chat/completions", json={**CHAT_BODY, "stream": stream}) for _ in range(5)]
+    after = gw.post("/v1/chat/completions", json={**CHAT_BODY, "stream": stream})
+
+    assert [r.headers["x-gateway-provider"] for r in slow] == ["openai"] * 5  # slow, but answered: they're served
+    assert after.headers["x-gateway-provider"] == "ollama"
+    assert after.headers["x-gateway-attempts"] == "openai:circuit_open"
+    assert openai.call_count == 5
+
+
+def test_a_long_answer_is_not_a_slow_one():
+    # 40 s for 1,000 tokens is a provider writing a lot, not one keeping us waiting
+    assert upstream.waited(40.0, {"completion_tokens": 1000}) < 0
+    # 20 s for 40 tokens is 18 s of waiting before it started
+    assert upstream.waited(20.0, {"completion_tokens": 40}) == pytest.approx(18.0)
+    assert upstream.waited(20.0, None) == 20.0  # no usage: count it all as waiting

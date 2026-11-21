@@ -8,6 +8,10 @@ failure kind keeps its meaning (DESIGN.md section 4). The connection limit is ou
 so a full pool is always httpx.PoolTimeout (our overload, Q2) and never confused with a provider that won't connect.
 Based on httpx-aiohttp (github.com/karpetrosyan/httpx-aiohttp), whose mapping turns both of those, and a dropped
 connection after sending, into ConnectTimeout.
+
+Each provider also gets at most `per_provider` of the connections (a bulkhead, DECISIONS.md R2). A provider that
+turns slow holds its connections for as long as it's slow; without this it took all of them, and requests to
+healthy providers got 503 (R1).
 """
 import asyncio
 from typing import AsyncIterator, Callable, Optional
@@ -18,6 +22,11 @@ import httpx
 # Close idle connections after this long. Under most servers' own keep-alive (uvicorn's is 5 s), so we don't
 # send a request down a connection the server is closing at the same moment.
 KEEPALIVE_S = 4.0
+
+
+class ProviderFull(httpx.PoolTimeout):
+    """This provider already has its share of our connections. Raised at once, without waiting: the caller should
+    try another provider. Our limit, like PoolTimeout, so it says nothing about the provider's health."""
 
 
 def _to_httpx(exc: aiohttp.ClientError) -> httpx.TransportError:
@@ -49,8 +58,10 @@ class _Body(httpx.AsyncByteStream):
 
 
 class AiohttpTransport(httpx.AsyncBaseTransport):
-    def __init__(self, max_connections: int):
+    def __init__(self, max_connections: int, per_provider: Optional[int] = None):
         self.slots = asyncio.Semaphore(max_connections)
+        self.per_provider = per_provider  # None: no limit per provider, only the total
+        self.open_to: dict = {}  # (host, port) -> connections in use to it
         self.session: Optional[aiohttp.ClientSession] = None  # made on first use, inside the running event loop
 
     def _session(self) -> aiohttp.ClientSession:
@@ -86,7 +97,20 @@ class AiohttpTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         timeout = request.extensions.get("timeout", {})
-        await self._take_slot(timeout.get("pool"))
+        provider = (request.url.host, request.url.port)
+        if self.per_provider and self.open_to.get(provider, 0) >= self.per_provider:
+            raise ProviderFull(f"{self.per_provider} connections to {request.url.host} already in use")
+        self.open_to[provider] = self.open_to.get(provider, 0) + 1  # counted before any await: no one can slip in
+
+        def release():
+            self.open_to[provider] -= 1
+            self.slots.release()
+
+        try:
+            await self._take_slot(timeout.get("pool"))
+        except BaseException:
+            self.open_to[provider] -= 1
+            raise
         try:
             response = await self._session().request(
                 request.method, str(request.url),
@@ -97,10 +121,10 @@ class AiohttpTransport(httpx.AsyncBaseTransport):
                 timeout=aiohttp.ClientTimeout(sock_connect=timeout.get("connect"), sock_read=timeout.get("read")),
             )
         except aiohttp.ClientError as exc:
-            self.slots.release()
+            release()
             raise _to_httpx(exc) from exc
         except BaseException:
-            self.slots.release()
+            release()
             raise
 
         released = False
@@ -109,7 +133,7 @@ class AiohttpTransport(httpx.AsyncBaseTransport):
             nonlocal released
             if not released:
                 released = True
-                self.slots.release()
+                release()
 
         return httpx.Response(
             status_code=response.status,

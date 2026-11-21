@@ -57,4 +57,5 @@ prices:
 budgets:
   default: {soft_usd: 1000, max_usd: 1000}  # high enough that only the budget tests ever hit it
 
+slow_call_s: 0  # off: a slow test machine must not trip breakers; test_fallback.py turns it on itself
 overload_target_ms: 0  # off: a slow test machine must not shed; test_shedding.py turns it on itself

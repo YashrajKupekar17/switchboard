@@ -6,7 +6,7 @@ import socket
 import httpx
 from aiohttp import web
 
-from transport import AiohttpTransport
+from transport import AiohttpTransport, ProviderFull
 from upstream import classify_exception
 
 SHORT = httpx.Timeout(connect=1.0, read=0.3, write=1.0, pool=0.2)
@@ -92,6 +92,35 @@ def test_full_pool_is_a_pool_timeout_so_our_overload():
             assert (await first).status_code == 200
             assert (await http.post(url, json={})).status_code == 200  # the slot came back
         await runner.cleanup()
+    run(test)
+
+
+def test_provider_at_its_share_is_refused_at_once_while_others_have_room():
+    async def test():
+        hold = asyncio.Event()
+
+        async def slow(request):
+            await hold.wait()
+            return web.json_response({})
+
+        slow_runner, slow_url = await serve(slow)
+        ok_runner, ok_url = await serve(ok)
+        async with httpx.AsyncClient(transport=AiohttpTransport(10, per_provider=1), timeout=SHORT) as http:
+            first = asyncio.ensure_future(http.post(slow_url, json={}, timeout=5))
+            await asyncio.sleep(0.05)  # first holds the slow provider's only connection
+            started = asyncio.get_running_loop().time()
+            try:
+                await http.post(slow_url, json={})
+                raise AssertionError("expected ProviderFull")
+            except ProviderFull as exc:
+                assert kind(exc) == "provider_full"
+            assert asyncio.get_running_loop().time() - started < 0.1  # refused at once, not after the pool wait
+            assert (await http.post(ok_url, json={})).status_code == 200  # another provider still has room
+            hold.set()
+            assert (await first).status_code == 200
+            assert (await http.post(slow_url, json={})).status_code == 200  # its connection came back
+        await slow_runner.cleanup()
+        await ok_runner.cleanup()
     run(test)
 
 

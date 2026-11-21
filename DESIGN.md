@@ -286,6 +286,8 @@ List every metric: name, type (counter, histogram, gauge), and labels.
 
 **The bottleneck:** first httpx's default pool of 100 connections (~90 RPS), then httpcore's O(n²) pool bookkeeping (88% of the CPU at 150 RPS). After both fixes the profile is flat: the remaining cost is the async Python stack itself.
 
+**Provider outage** (100 RPS, first-choice provider broken for 60 s, DECISIONS.md R): killed or returning 500s, 100% of requests succeeded through the fallback. Slow (20 s per answer), only 60% did at first: slow answers counted as successes and took the whole connection pool. After a per-provider connection cap and counting slow answers as breaker failures, 100%.
+
 ---
 
 ## 10. Scaling and failure scenarios (interview drill)
