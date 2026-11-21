@@ -1017,6 +1017,10 @@ Same runs, final build, success rate while `mock` was broken:
 | slow | **100%** (5,493), was 60% | 620 requests waited ~21 s: the bulkhead let ~600 in, then sent the rest to `mock-b` at once. The breaker opened 21 s in, when the first slow answers came back. p50 1.1 s, p99 20.8 s |
 | kill, streamed | 99.1% | not re-run; the fixes don't change it. A stream that has started can't move to another provider, so the client has to retry |
 
+- **On the dashboard** (a later run of the same test): requests in flight go from ~110 (100/s × 1.1 s) to ~500 while slow answers are held, under the 600 cap, and back to ~110 once the breaker opens. Without the fixes they'd have climbed to the 1,000-connection limit and stayed there.
+
+  ![Requests in flight during the slow-provider test: ~110, a spike to ~500, then back to ~110](docs/grafana-chaos-in-flight.png)
+
 - **Recovery is slower than it could be:** trials go every 30 s. If one lands while `mock` is still restarting, or still slow, the breaker waits another 30 s. Traffic stayed on `mock-b` for 30-40 s after `mock` was healthy, which is fine while the fallback has room.
 - **Seen, not explained yet:**
   - Requests shed with nothing overloaded: in the first second after the gateway starts (11-79 requests), once mid-run (33), and around the kill in the streamed run (~50). They didn't appear in the final kill and errors runs.

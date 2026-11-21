@@ -123,6 +123,10 @@ The slow provider was the one that broke things. A 20 s answer is under the time
 - Each provider can use at most 600 of the 1,000 connections. Past that, requests go straight to the next provider.
 - An answer that kept us waiting more than 10 s counts as a failure for the breaker, so traffic moves to the fallback after five of them.
 
+![Grafana during the slow-provider test: traffic steady at ~100 requests/s with no client errors. p95 latency jumps to ~22 s while the first slow answers are served, then drops back to ~1 s. Attempts on mock fall as slow and circuit_open rise, fallbacks reach 100/s, and one breaker shows open.](docs/grafana-chaos-slow.png)
+
+*The on-call dashboard during the slow-provider test. Clients saw no errors. p95 latency spiked while the first ~600 slow answers came back, then the breaker opened and every request went to the fallback.*
+
 DECISIONS.md section R has the details; `loadtest/chaos.sh` runs it.
 
 ## Running it
