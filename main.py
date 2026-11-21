@@ -6,12 +6,13 @@ import os
 import random
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import redis.asyncio as redis
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
@@ -39,10 +40,13 @@ CONFIG = load_config(os.environ.get("GATEWAY_CONFIG", "config.yaml"))
 
 
 class Message(BaseModel):
+    # Only what the gateway itself reads is checked here. The rest of OpenAI's format (image parts, tool calls,
+    # names) is the provider's to validate: its 400 reaches the client as-is, and the gateway never falls behind
+    # when the format grows.
     model_config = ConfigDict(extra="allow")
 
-    role: str  # "system" | "user" | "assistant"
-    content: str
+    role: str  # "system" | "developer" | "user" | "assistant" | "tool"
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None  # text, a list of parts, or none (a tool call)
 
 
 class ChatRequest(BaseModel):
@@ -157,6 +161,18 @@ async def auth_error(request: Request, exc: AuthError):
         status_code=exc.status,
         content={"error": {"message": exc.message, "type": "invalid_request_error", "code": exc.code}},
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    # FastAPI's default is a 422 with its own {"detail": [...]}. OpenAI answers a malformed request with a 400 in
+    # its usual shape, which SDKs turn into BadRequestError, so do the same.
+    first = exc.errors()[0]
+    param = ".".join(str(part) for part in first["loc"] if part != "body")
+    return JSONResponse(status_code=400, content={"error": {
+        "message": f"{param or 'body'}: {first['msg']}", "type": "invalid_request_error", "param": param or None,
+        "code": None,
+    }})
 
 
 async def require_key(request: Request, authorization: Optional[str] = Header(default=None)) -> keys.KeyInfo:
@@ -302,6 +318,9 @@ async def chat_completions(
         if shadow_route and cache.storable(body):
             _spawn(_shadow_route(caller.team, route, chosen, reason, payload, body))
 
+    # Did the client ask for the usage report at the end of a stream? We always ask the provider for it, for billing,
+    # but only pass it on if the client asked: its chunk has an empty `choices`, which breaks `chunk.choices[0]`.
+    client_wants_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
     if request.stream:
         # Providers only send token usage at the end of a stream if asked to; we need it for cost tracking.
         payload["stream_options"] = {**payload.get("stream_options", {}), "include_usage": True}
@@ -324,7 +343,7 @@ async def chat_completions(
                     app.state.http, target, payload, request.stream, on_usage=lambda u, t=target: settle(t, u),
                     on_complete=(lambda b, t=target: completed(t, b)) if (caching.enabled or shadow_route) and i == 0
                     else None,
-                    on_waited=waits.append,
+                    on_waited=waits.append, forward_usage=client_wants_usage,
                 )
             finally:
                 if result is None:  # cancelled or crashed before the provider gave a verdict

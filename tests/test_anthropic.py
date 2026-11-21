@@ -83,6 +83,12 @@ def test_request_with_features_anthropic_cannot_do_is_unsupported():
         to_anthropic({**CLAUDE_BODY, "tools": [{"type": "function"}]})
 
 
+@pytest.mark.parametrize("content", [None, [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "x"}}]])
+def test_content_other_than_text_is_unsupported_so_another_target_takes_it(content):
+    with pytest.raises(Unsupported, match="plain text"):
+        to_anthropic({**CLAUDE_BODY, "messages": [{"role": "user", "content": content}]})
+
+
 # --- non-streaming ---
 
 
@@ -171,7 +177,7 @@ def test_a_real_provider_failure_outranks_unsupported(client):
 def test_stream_is_translated_into_openai_chunks(client):
     respx.post(ANTHROPIC_URL).mock(return_value=anthropic_stream(FULL_STREAM))
 
-    resp = client.post("/v1/chat/completions", json={**CLAUDE_BODY, "stream": True})
+    resp = client.post("/v1/chat/completions", json={**CLAUDE_BODY, "stream": True, "stream_options": {"include_usage": True}})
 
     assert resp.status_code == 200
     lines = data_lines(resp)
@@ -193,7 +199,7 @@ def test_openai_sdk_streams_from_anthropic_unchanged(client):
     respx.route(host="testserver").pass_through()
     sdk = OpenAI(base_url="http://testserver/v1", api_key=TEST_KEY, http_client=client)
 
-    chunks = list(sdk.chat.completions.create(stream=True, **CLAUDE_BODY))
+    chunks = list(sdk.chat.completions.create(stream=True, stream_options={"include_usage": True}, **CLAUDE_BODY))
 
     assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices) == "Hello"
     assert chunks[-1].usage.completion_tokens == 7

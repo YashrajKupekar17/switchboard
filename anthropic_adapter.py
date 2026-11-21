@@ -38,6 +38,10 @@ def to_anthropic(payload: dict) -> Tuple[dict, List[str]]:
 
     system, messages = [], []
     for m in payload["messages"]:
+        if not isinstance(m.get("content"), str):
+            # A list of parts (images) or no content (a tool call) needs translating into Anthropic's own blocks,
+            # which isn't built: skip this provider, and another target may take the request.
+            raise Unsupported("message content other than plain text is not supported by this provider")
         if m["role"] in ("system", "developer"):
             system.append(m["content"])  # Anthropic takes the system prompt as a separate field
         elif m["role"] in ("user", "assistant"):

@@ -9,6 +9,7 @@ used more than it had goes below zero and waits until the bucket refills.
 
 If Redis is down we fail open, onto a bucket in this copy's memory with the limit split across copies.
 """
+import json
 import logging
 import math
 import time
@@ -23,6 +24,9 @@ from metrics import RATE_LIMIT_DEGRADED
 log = logging.getLogger("gateway")
 
 CHARS_PER_TOKEN = 4  # rough rule for English text; settle() corrects it once real usage comes back
+# An image's real cost depends on its size and detail setting (85 to ~1,500 tokens on OpenAI); this is a 1024x1024
+# image at high detail. Counting the image's base64 text instead would make a 1 MB photo look like 250,000 tokens.
+IMAGE_TOKENS = 765
 REDIS_RETRY_AFTER = 5.0  # after a Redis error, use the local buckets for this long before trying Redis again
 
 
@@ -41,9 +45,27 @@ class Decision:
     exceeded: str = ""  # "requests" or "tokens", same words as OpenAI's 429
 
 
+def text_of(content) -> str:
+    """The text in a message's content: a string, or OpenAI's list of parts ({"type": "text", "text": ...},
+    {"type": "image_url", ...}). None for an assistant message that only calls tools."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
 def estimate_tokens(messages: list) -> int:
-    chars = sum(len(str(m.get("content") or "")) for m in messages)
-    return math.ceil(chars / CHARS_PER_TOKEN) + 4 * len(messages)  # a few tokens of overhead per message
+    chars = images = 0
+    for m in messages:
+        content = m.get("content")
+        chars += len(text_of(content))
+        if isinstance(content, list):
+            images += sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+        if m.get("tool_calls"):
+            chars += len(json.dumps(m["tool_calls"]))  # the arguments a model sent are input on the next turn
+    # a few tokens of overhead per message
+    return math.ceil(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKENS + 4 * len(messages)
 
 
 # Both buckets are checked and taken in one script: Redis runs it by itself, so two gateway copies can never

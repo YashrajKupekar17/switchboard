@@ -63,7 +63,7 @@ def test_unknown_model_names_share_one_label(client):
 
 
 def test_invalid_request_is_still_counted(client):
-    invalid = Delta("gateway_requests_total", model="unknown", status="422")
+    invalid = Delta("gateway_requests_total", model="unknown", status="400")
 
     client.post("/v1/chat/completions", json={"messages": []})  # never reaches the endpoint
 

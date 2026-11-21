@@ -152,7 +152,7 @@ def test_stream_falls_back_on_5xx_before_first_chunk(client):
     respx.post(OPENAI_URL).mock(return_value=httpx.Response(503))
     respx.post(OLLAMA_URL).mock(return_value=sse())
 
-    resp = client.post("/v1/chat/completions", json={**CHAT_BODY, "stream": True})
+    resp = client.post("/v1/chat/completions", json={**CHAT_BODY, "stream": True, "stream_options": {"include_usage": True}})
 
     assert resp.status_code == 200
     assert resp.headers["x-gateway-provider"] == "ollama"

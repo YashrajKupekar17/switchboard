@@ -111,11 +111,12 @@ def waited(seconds: float, usage: Optional[dict]) -> float:
 
 async def call_target(
     http: httpx.AsyncClient, target: Target, payload: dict, stream: bool, on_usage: UsageCallback = _ignore_usage,
-    on_complete: CompleteCallback = None, on_waited: WaitedCallback = _ignore_waited,
+    on_complete: CompleteCallback = None, on_waited: WaitedCallback = _ignore_waited, forward_usage: bool = True,
 ) -> Union[Response, Failure]:
     """on_usage gets the provider's usage report once the answer is complete (None if it never arrived).
     on_complete gets the whole answer, only if it finished cleanly; for a stream that means [DONE] arrived.
-    on_waited gets how long the provider made us wait, before this returns, for answers that arrived."""
+    on_waited gets how long the provider made us wait, before this returns, for answers that arrived.
+    forward_usage=False keeps a stream's usage-only chunk from the client (it's still read, for billing)."""
     payload = {**payload, "model": target.model}  # the provider's own name for the model
     headers = {"x-gateway-provider": target.provider.name}
     is_anthropic = target.provider.type == "anthropic"
@@ -127,7 +128,7 @@ async def call_target(
         if dropped:
             headers["x-gateway-dropped-params"] = ",".join(dropped)  # tell the client, don't hide it
     if stream:
-        return await _call_stream(http, target, payload, headers, on_usage, on_complete, on_waited)
+        return await _call_stream(http, target, payload, headers, on_usage, on_complete, on_waited, forward_usage)
 
     started = time.perf_counter()
     try:
@@ -156,7 +157,7 @@ async def call_target(
 
 async def _call_stream(
     http: httpx.AsyncClient, target: Target, payload: dict, headers: dict, on_usage: UsageCallback,
-    on_complete: CompleteCallback, on_waited: WaitedCallback,
+    on_complete: CompleteCallback, on_waited: WaitedCallback, forward_usage: bool,
 ):
     started = time.perf_counter()
     try:
@@ -184,7 +185,7 @@ async def _call_stream(
     on_waited(time.perf_counter() - started)
     lines, buffered = first
     return StreamingResponse(
-        relay_stream(_replay(buffered, lines), started, target.deployment, on_usage, on_complete),
+        relay_stream(_replay(buffered, lines), started, target.deployment, on_usage, on_complete, forward_usage),
         media_type="text/event-stream",
         headers=headers,
         background=BackgroundTask(upstream.aclose),  # release the connection even if the client disconnects
@@ -226,8 +227,10 @@ async def _replay(buffered: list, rest):
 
 async def relay_stream(
     lines, started: float, deployment: str, on_usage: UsageCallback = _ignore_usage, on_complete: CompleteCallback = None,
+    forward_usage: bool = True,
 ):
-    """Forward SSE lines to the client unchanged, while watching them for TTFT and usage."""
+    """Forward SSE events to the client unchanged, while watching them for TTFT and usage. With forward_usage=False,
+    the usage-only chunk (empty `choices`) is read but not sent: the client didn't ask for it."""
     first_token_at = None
     usage = None
     chunks = [] if on_complete else None  # kept only when someone wants the whole answer (the cache)
@@ -236,13 +239,10 @@ async def relay_stream(
     # one write, not one per line: every write goes through Starlette, uvicorn and the socket, and per-line writes
     # doubled the cost of a stream (DECISIONS.md Q4).
     event = []
+    hold_back = False  # the current event is the usage report the client didn't ask for
 
     try:
         async for line in lines:
-            event.append(line + "\n")
-            if line == "":
-                yield "".join(event)
-                event = []
             if line == "data: [DONE]":
                 finished = True
             elif line.startswith("data: "):
@@ -251,9 +251,15 @@ async def relay_stream(
                     first_token_at = time.perf_counter()
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                    hold_back = not forward_usage and not chunk.get("choices")
                 if chunks is not None:
                     chunks.append(chunk)
-        if event:  # the provider ended without a final blank line
+            event.append(line + "\n")
+            if line == "":
+                if not hold_back:
+                    yield "".join(event)
+                event, hold_back = [], False
+        if event and not hold_back:  # the provider ended without a final blank line
             yield "".join(event)
     except (httpx.HTTPError, StreamError) as exc:
         # Lines of an unfinished event are dropped: sent before the error event, they'd merge into it (an SSE

@@ -56,7 +56,9 @@ def test_invalid_request_is_rejected_without_calling_openai(client):
 
     resp = client.post("/v1/chat/completions", json={"messages": []})  # no model
 
-    assert resp.status_code == 422
+    assert resp.status_code == 400  # what OpenAI answers, so SDKs raise BadRequestError
+    assert resp.json()["error"] == {"message": "model: Field required", "type": "invalid_request_error",
+                                    "param": "model", "code": None}
     assert not route.called
 
 
@@ -75,13 +77,28 @@ def test_streams_chunks_through_unchanged(client):
         return_value=httpx.Response(200, content=FAKE_SSE, headers={"content-type": "text/event-stream"})
     )
 
-    resp = client.post("/v1/chat/completions", json={**CHAT_BODY, "stream": True})
+    resp = client.post("/v1/chat/completions", json={**CHAT_BODY, "stream": True, "stream_options": {"include_usage": True}})
 
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert resp.content == FAKE_SSE
+
+
+@respx.mock
+def test_usage_chunk_is_held_back_unless_the_client_asked_for_it(client, ledger):
+    route = respx.post(OPENAI_URL).mock(
+        return_value=httpx.Response(200, content=FAKE_SSE, headers={"content-type": "text/event-stream"})
+    )
+
+    resp = client.post("/v1/chat/completions", json={**CHAT_BODY, "stream": True})
+
     sent = json.loads(route.calls.last.request.content)
-    assert sent["stream_options"]["include_usage"] is True  # gateway asks for usage so it can track cost
+    assert sent["stream_options"]["include_usage"] is True  # the gateway always asks, so it can bill
+    events = [e for e in resp.text.split("\n\n") if e]
+    assert events[-1] == "data: [DONE]"
+    assert all(json.loads(e[len("data: "):])["choices"] for e in events[:-1])  # chunk.choices[0] never fails
+    asyncio.run(client.app.state.budgets.flush())
+    assert ledger.rows[-1][8] == 2  # output tokens: still billed from the usage it held back
 
 
 @respx.mock

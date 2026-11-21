@@ -45,11 +45,13 @@ curl http://localhost:8000/v1/chat/completions \
 ```python
 stream = client.chat.completions.create(model="gpt-4o-mini", messages=messages, stream=True)
 for chunk in stream:
-    if chunk.choices and chunk.choices[0].delta.content:  # check choices first, see below
+    if chunk.choices and chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
 ```
 
-The gateway always asks the provider for token usage so it can bill your team. A live stream therefore ends with one extra chunk that has `usage` and an **empty `choices` list**, even if you didn't ask for it. Code that does `chunk.choices[0]` without checking will crash on that last chunk.
+As with OpenAI, if you send `stream_options={"include_usage": True}`, the last chunk before `[DONE]` carries `usage` and an empty `choices` list. Without it you don't get that chunk. (The gateway always asks the provider for usage, to bill your team, and only passes it on if you asked.)
+
+Images (content as a list of parts) and tool calling across several turns work the same as with OpenAI.
 
 Only Chat Completions is available. There's no `/v1/models`, embeddings or Responses API, so `client.models.list()` returns 404.
 
@@ -105,7 +107,7 @@ Errors come back in OpenAI's shape, `{"error": {"message", "type", "code"}}`, so
 | 404 | `model_not_found` | The model name isn't configured | Use a name from section 3 |
 | 400 | from the provider | Your request was invalid (bad parameter, too long for the model) | Fix the request. It's passed through as the provider sent it, and never tried elsewhere |
 | 400 | `invalid_request_error` | No provider for this model supports a feature you used | Remove the feature or use another model |
-| 422 | (FastAPI's `detail`) | The request didn't match the expected format. See section 9 | Fix the request |
+| 400 | `invalid_request_error`, with `param` | The gateway couldn't read the request: no `model`, `messages` not a list | Fix the request |
 | 429 | `rate_limit_exceeded` | Your team is over its requests or tokens per minute | Wait `Retry-After` seconds and retry. The OpenAI SDK does this for you |
 | 429 | `rate_limit_exceeded`, message "request too large" | This one request needs more tokens than your team's whole per-minute limit | Retrying won't help. Shorten it, or ask for a higher limit |
 | 429 | `budget_exceeded` | Your team has spent its monthly budget | Don't retry: it resets on the 1st (UTC). Talk to the platform team |
@@ -146,9 +148,8 @@ The cache is **off unless your team turns it on**, in `config.yaml` or with `x-g
 
 ## 9. What doesn't work yet
 
-- **Message `content` must be a string.** Content given as a list of parts (images, or text split into parts) is refused with a 422. So is an assistant message with `"content": null` and `tool_calls`, which means tool calling across several turns doesn't work yet. Sending tools in a single request works.
+- **Images count as a fixed 765 tokens** toward your per-minute token limit before the call (a 1024×1024 image at high detail). The real count from the provider replaces the estimate afterwards, as it does for text.
 - **Only `/v1/chat/completions`.** No model listing, embeddings, audio, images or the Responses API.
 - **Anthropic models (off in the default config) refuse what they can't translate**, such as tools or `n` above 1. With other models in the list, such a request goes to one of them; if an Anthropic model is the only one left, you get a 400.
-- **422 errors aren't in OpenAI's shape.** They come from FastAPI as `{"detail": [...]}`.
 
 `http://localhost:8000/docs` lists the endpoint and its request format, generated from the code.
