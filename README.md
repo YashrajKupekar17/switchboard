@@ -160,6 +160,8 @@ export SWITCHBOARD_API_KEY=sbk_...                        # the key it printed
 
 Then open Grafana at http://localhost:3000 and go to Dashboards > Gateway: on-call.
 
+To call it from your own code, see [docs/USING.md](docs/USING.md): models, headers, errors and what to do about each.
+
 `docker compose up` first runs a one-off `db-setup` container that creates the tables and a `gateway` database user. The gateway copies log in as that user, which can read keys and add usage rows but can't create keys, edit spend, or change tables. `scripts/keys.py` runs on your machine as the database owner.
 
 To run a single gateway outside Docker while developing, keep the other services running, run `scripts/setup_db.py` once, and start `.venv/bin/uvicorn main:app --port 8001`.
@@ -183,6 +185,7 @@ Tests mock every provider, the key store and Redis, so they don't need a key, Po
 
 ## Docs
 
+- [docs/USING.md](docs/USING.md): for developers calling the gateway: connecting, models, headers, errors, limits, the cache
 - [DESIGN.md](DESIGN.md): the problem, requirements, estimates, and architecture
 - [DECISIONS.md](DECISIONS.md): every decision, with the alternatives, trade-offs, and further reading
 - [PROJECT.md](PROJECT.md): the original spec
