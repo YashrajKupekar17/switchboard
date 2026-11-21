@@ -80,6 +80,7 @@ rate_limits:
   default: {rpm: 60, tpm: 100000}
   teams:                      # overrides; a team not listed here gets the default
     search: {rpm: 600, tpm: 1000000}
+    replay: {rpm: 600, tpm: 1000000}   # scripts/cache_replay.py
   gateway_copies: 3           # while Redis is down, each copy enforces limit / gateway_copies on its own
                               # (keep in sync with `replicas` in docker-compose.yml)
 
@@ -116,6 +117,7 @@ cache:
   default: {enabled: false, ttl: 3600, semantic: "off", threshold: 0.70}
   teams:
     search: {enabled: true, semantic: shadow}
+    replay: {enabled: true, semantic: "on"}   # scripts/cache_replay.py: what caching saves a support bot
 
 # Capacity of each gateway copy (DECISIONS.md Q). Measured with loadtest/, on one CPU per copy.
 # Calls to providers this copy can have open at once. Each one is open for the whole answer, so you need about

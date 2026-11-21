@@ -70,6 +70,17 @@ Groq and Anthropic are wired up and tested against a fake Anthropic, but I haven
 
 **Semantic cache.** A team can also let a question that *means* the same as a stored one get the stored answer ("When are you open?" for "What are your opening hours?"). An embedding finds the closest stored question, but it doesn't decide: on 40 hand-written pairs, real paraphrases scored 0.58-0.87 while near-misses like "refund *after* 30 days" vs "*within* 30 days" scored up to 0.96, so no similarity threshold is safe. Instead, gpt-4o-mini reads both questions and decides, which gave no wrong answers on the same pairs. That costs about 0.7 s on candidates only, so it's off by default, and has a shadow mode that runs everything without serving it and saves the pairs and verdicts, so a team can measure it on its own traffic with `scripts/semantic_eval.py` before turning it on. If any step is slow or fails, the request is just a miss.
 
+**What the cache saves, replayed.** 1,000 customer-support questions (sampled from Bitext's public dataset), sent in order to a support bot on gpt-4o-mini with both caches on:
+
+| | |
+|---|---|
+| Exact hits | 0.4%: people rarely type the same thing twice |
+| Semantic hits (judge approved) | 57%, answered in 0.95 s instead of 1.9 s |
+| Cost | 38% lower, after paying for the embedding and judge calls (the judge is a fifth of the bill when answers are this cheap; on gpt-4o it would be ~57% lower) |
+| Wrong answers | 24 of 570 semantic hits (4.2%) answered a different question. About 10 were real mistakes ("remove items from my order" got the cancel-order answer), and twice a question about one invoice number got the answer written for another |
+
+So for a support bot it pays off, and it's still not safe for questions about a specific order or account. DECISIONS.md section S has the details; `scripts/cache_replay.py` runs it.
+
 **Fallback and retries.** The rule is to fall back only when the problem is the provider's, never the client's:
 
 | What happened | What switchboard does |

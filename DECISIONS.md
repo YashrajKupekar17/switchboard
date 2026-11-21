@@ -1031,3 +1031,50 @@ Same runs, final build, success rate while `mock` was broken:
   - Slow answers, streamed and not, are served but open the breaker after 5. Unit test: a long answer isn't a slow one.
   - Three mutations, one per new piece of logic, were each caught.
 
+## S. What the cache saves on a replayed workload
+
+### S1. The workload, and why this one
+- **The question the spec asked:** "cache hit rate and the resulting % cost reduction on a replayed workload". The answer depends almost entirely on the workload: how often its users ask the same thing. So the first decision is whose traffic.
+- **Not general chat** (a random sample of WildChat or LMSYS): across millions of users and every topic, a sample of 1,000 barely repeats, and no team would turn a cache on for that traffic.
+- **A support bot**, the case a team turns caching on for: 1,000 questions sampled at random (seed 17) from Bitext's customer-support dataset, 26,872 questions an online store's customers might ask, each labelled with one of 27 intents (CDLA-Sharing-1.0). Not committed; `scripts/cache_replay.py sample` downloads it and draws the same sample every time.
+- **The replay:** sent in order, 4 at a time, through the normal stack (3 copies, real gpt-4o-mini, `temperature: 0`, answers capped at 200 tokens), as team `replay` with the exact cache and the semantic cache `on` (threshold 0.70, judge at 0.9, O10). 2026-11-21, about 10 minutes, under $0.05.
+- **Cost, counted honestly:** the ledger has what answers cost and what hits would have cost (`saved_micros`). The semantic cache's own calls aren't in the ledger, so the script counts them from Prometheus (`gateway_semantic_step_seconds_count`, before and after) and prices them at 4 characters per token. Without that, the saving would be overstated.
+- **Was each hit right?** A served hit carries the `id` of the answer it was stored from, so the script knows which earlier question it really answered. If that question had a different intent, the hit is counted wrong.
+
+### S2. Results
+
+| | Requests | Time p50 / p95 |
+|---|---|---|
+| Miss | 426 (42.6%) | 1.94 s / 2.63 s |
+| Exact hit | 4 (0.4%) | 0.008 s |
+| Semantic hit | 570 (57.0%) | 0.95 s / 1.18 s |
+
+- **Cost:** $0.0432 without the cache, $0.0267 with it: **38% saved**. The cache avoided 58% of the answer cost, and the 755 judge calls ($0.0084) and 996 embeddings ($0.0002) gave a third of that back.
+- **Why the judge costs so much here:** each judge call is ~6% of a gpt-4o-mini answer (O9), and only 3 in 4 calls led to a hit. With a model that costs more per answer, the same judge costs a smaller share: at gpt-4o's prices the saving would be about 57%. That's arithmetic on these numbers, not a run.
+- **The judge's approval rate was 75%** (570 of 755 candidates), well above the ~25% where it starts paying off in time (O10). The 185 it rejected waited ~1 s longer than with no cache.
+- **Exact hits barely happen:** 9 repeated questions in 1,000. People phrase the same need differently, so for this traffic the exact cache alone is almost worthless and the semantic cache is the whole saving.
+- **Only 4 of the 9 repeats were exact hits.** The other 5 had first come in as semantic hits, and a semantic hit isn't stored under the new question's own key. So the repeat went through the embedding and the judge again: same answer, ~1 s and a judge call it didn't need. Storing approved semantic hits under the new question's exact key would fix it. Not done: it's 5 requests in 1,000 here.
+
+### S3. The wrong answers
+24 of 570 semantic hits (**4.2%**) served the answer to a question with a different intent. Read one by one:
+- **14 were invoice "get" vs "check"** ("I need to get my bill from X" answered with the reply to "I have to check my bills from X"). The two replies overlap a lot; borderline at worst.
+- **About 10 were real mistakes**, all between neighbouring intents:
+  - "I want my money back" answered as "track my refund" (4);
+  - "remove items from order 1234" answered as "cancel order 1234" (2), the worst kind, since following it loses the whole order;
+  - "switch to the premium account" answered as "create one" (2);
+  - "set up a shipping address" vs "change" it (2).
+- **Twice the judge passed different numbers:** "how do I see bill #85632" and "look for my bill #00108" both got the answer written for bill #37777. That's the trap from O7, through the judge on real-looking traffic.
+- **So about 2% clearly wrong, against intent labels.** On the 40 hand-written pairs the judge made no mistakes (O9); on Quora and PAWS, 9-20% (O11, O12). This lands in between.
+
+### S4. What it means, and its limits
+- **For a support bot, the cache pays:** a bit over a third off the bill and half the latency on half the requests, if a team accepts that roughly 1 in 50 cached answers is for a neighbouring question. The cancel-vs-remove case is why semantic caching stays off by default and starts in shadow mode on the team's own traffic.
+- **Bitext makes it look better than real traffic would:**
+  - its order numbers, amounts and names are placeholders (`{{Order Number}}`), so "cancel order 1234" and "cancel order 5678" look identical. Real traffic has real numbers, which means fewer hits, and more wrong ones of the #85632/#37777 kind.
+  - the sample is spread evenly over 27 intents. Real traffic is lopsided (most people ask about delivery and refunds), which would mean more hits.
+  - 1,000 questions in 10 minutes all fit in the 1-hour TTL. A small team's hour has fewer questions to match against.
+- **What would make it safer:**
+  - don't cache answers to questions that contain numbers;
+  - a judge prompt that says numbers and actions must match (not tried: it's tuning on this test, the overfitting O9 warned about);
+  - per-intent caching from the team's own labels.
+- **Production terms:** *workload characterisation*, *hit rate vs cost reduction*, *verifier cost*, *precision against noisy labels*.
+
