@@ -1,11 +1,6 @@
 # Decisions
 
-Every design decision in this project: what we chose, what we rejected, why, and what it costs.
-Each entry also gives the **production term** for the idea (the words to use in interviews) and, where it really helps, something to read.
-
-**How to read an entry:** *I chose X over Y because Z. The cost is W, and we reduce it by V.* That one sentence is the interview answer.
-
-Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of each section.
+Every design decision in switchboard: what was chosen, what was rejected, why, and what it costs. Sections follow the order the system was built in; within a section, later decisions come last.
 
 ---
 
@@ -17,49 +12,43 @@ Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of eac
 - **Why:** with in-memory state, a request that lands on copy #3 can't see what copy #1 cached, and a restart or deploy wipes it.
 - **Pros:** add copies to handle more traffic; any copy can serve any request; deploys don't lose data.
 - **Cons:** every request now depends on a network call to Redis. *(Open: what happens when Redis is down? See A6.)*
-- **Production terms:** *stateless service*, *horizontal scaling*, *externalized state*.
-- **Read:** Kleppmann, *Designing Data-Intensive Applications*, ch. 1.
+- **References:** Kleppmann, *Designing Data-Intensive Applications*, ch. 1.
 
 ### A2. Redis on its own machine, in the same data center
 - **Decision:** Redis is a separate server, not on a gateway machine, but in the same data center or region.
 - **Alternatives:** Redis on one of the gateway machines; Redis in another region.
 - **Why:** with 3 gateway copies, putting Redis on one of them makes that machine special, and its failure takes the cache down too. In another region, each call is about 80 ms, which alone breaks our 20 ms overhead budget. In the same data center it's about 0.5 ms.
-- **Production terms:** *network latency budget*, *single point of failure (SPOF)*, *managed service* (for example, AWS ElastiCache).
-- **Read:** "Latency Numbers Every Programmer Should Know" (a one-page chart).
+- **References:** "Latency Numbers Every Programmer Should Know".
 
 ### A3. Pipeline order: auth → rate limit → cache → router → provider
 - **Decision:** authenticate first, then rate-limit, then check the cache, and only then route to a provider.
 - **Alternatives:** cache before auth (skip auth on cache hits).
 - **Why:** a cache before auth would hand cached answers to anyone, even without a key. The rate limiter needs to know the team, so it has to come after auth.
-- **Production terms:** *request pipeline*, *middleware chain*, *authentication (who are you) vs authorization (what are you allowed to do)*.
 
 ### A4. Rate limiter before the cache
 - **Decision:** rate limits apply even to requests that would be cache hits.
 - **Alternatives:** rate-limit only after a cache miss, because a cache hit costs almost nothing.
 - **Why:** a broken script sending the same cached request 50,000 times a second still overloads the gateway and Redis, even though the LLM is never called.
 - **Cons:** a team's cache hits use up its request limit. *(Open: two limits? A cheap flood limit early, and a token/budget limit just before the LLM call.)*
-- **Production terms:** *noisy neighbor* (one tenant hurting the others; our "broken script" problem), *load shedding*, *multi-tenancy*.
-- **Read:** Stripe Engineering blog, "Scaling your API with rate limiters."
+- **References:** Stripe Engineering blog, "Scaling your API with rate limiters."
 
 ### A5. Async I/O
 - **Decision:** async Python (FastAPI with `async`/`await`), not one thread per request.
 - **Why:** from Little's Law, 300 RPS × 5 s per LLM call means **about 1,500 requests in flight** at peak, and 6,000+ if a provider slows to 20 s. The gateway mostly *waits*. Async lets one process wait on thousands of requests cheaply.
-- **Production terms:** *Little's Law* (L = λ × W), *I/O-bound vs CPU-bound*, *event loop*, *concurrency vs parallelism*.
-- **Read:** Wikipedia, "Little's law" (just the intro and the examples).
+- **References:** Wikipedia, "Little's law".
 
 ### A6. *(Open)* What happens when Redis is down?
-- To decide in Phase 3: **fail open** (skip the cache or limit and keep serving) or **fail closed** (reject requests), decided separately for the cache, rate limits, and budgets.
+- Decided later, per check (K, L, N): **fail open** (skip the cache or limit and keep serving) or **fail closed** (reject requests), decided separately for the cache, rate limits, and budgets.
 
 ---
 
-## B. Cache (designed; built in Phase 4)
+## B. Cache (first design)
 
 ### B1. Cache-aside
 - **Decision:** on a request, `GET` the key. On a hit, return it. On a miss (`nil`), call the LLM, `SET` the answer, then return it.
 - **Alternatives:** write-through (the cache sits in front of the source and writes through it). That doesn't fit, because an LLM isn't a database we write to.
 - **Note:** the order of saving and sending doesn't prevent a *cache stampede*. Identical requests that arrive during the first LLM call all miss either way. *(Open: request coalescing.)*
-- **Production terms:** *cache-aside / lazy loading*, *cache hit / miss*, *cache stampede / thundering herd*, *request coalescing / single-flight*.
-- **Read:** AWS Builders' Library, "Caching challenges and strategies."
+- **References:** AWS Builders' Library, "Caching challenges and strategies."
 
 ### B2. Cache key: `cache:<tenant>:<sha256(model + temperature + max_tokens + messages)>`
 - **Decision:** everything that changes the answer goes into the key. It's hashed for a fixed size, with the tenant kept readable as a prefix.
@@ -70,18 +59,16 @@ Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of eac
   - **all messages:** the system prompt changes the answer ("pirate" vs "lawyer").
   - **hash:** a 300-page prompt would otherwise be the key, and SHA-256 is always 64 characters.
   - **readable tenant prefix:** lets us find or delete all of one tenant's keys.
-- **Production terms:** *tenant isolation*, *cache key normalization*, *key namespacing*, *cryptographic hash*.
 
 ### B3. Entries expire with a TTL
 - **Decision:** every entry gets a TTL (`SET key value EX <seconds>`).
 - **Why:** it handles both stale answers (the refund policy changed) and a cache that fills up forever.
 - **Tradeoff:** a short TTL means fresher answers but more misses, which costs money. A long TTL means more hits but stale answers.
 - *(Open: a per-tenant TTL? Event-based invalidation? Who tells the gateway that data changed?)*
-- **Production terms:** *TTL*, *cache invalidation* (time-based vs event-based), *staleness*, *eviction policy (LRU)*.
 
 ---
 
-## C. Foundation (Phase 0)
+## C. Foundation
 
 ### C1. Python + FastAPI + httpx + Pydantic
 - **Why:** the standard production stack for async Python APIs. Pydantic validates requests, and httpx is an async HTTP client with connection pooling.
@@ -91,39 +78,33 @@ Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of eac
 - **Decision:** create one `httpx.AsyncClient` at startup (`lifespan`) and reuse it for every request.
 - **Alternatives:** create a new client per request.
 - **Why:** a new client per request opens a new TCP and TLS connection to the provider every time, which is slow and exhausts sockets. A shared client keeps a pool of connections open.
-- **Production terms:** *connection pooling*, *keep-alive*, *TLS handshake cost*, *file descriptor limits*.
-- **Read:** httpx docs, "Resource Limits" and "Timeouts."
+- **References:** httpx docs, "Resource Limits" and "Timeouts."
 
 ### C3. Secrets from the environment (`.env` in development); fail fast at startup
 - **Decision:** API keys come from environment variables, never from code. The config file holds only the *name* of the env var. A missing key stops startup with a clear error.
 - **Why:** code ends up on GitHub. Failing at startup means a broken deploy is caught at deploy time, not on the first request at 3 a.m.
-- **Production terms:** *12-factor config*, *secrets management*, *fail fast*.
-- **Read:** 12factor.net, "III. Config."
+- **References:** 12factor.net, "III. Config."
 
 ### C4. Validate requests before calling the provider
 - **Decision:** Pydantic checks the request shape. A missing `model` gets a 422 immediately, and the provider is never called.
 - **Why:** it's free and takes about 1 ms instead of a paid round trip. And a 4xx tells the client to fix their request, not to retry.
-- **Production terms:** *input validation at the edge*, *fail fast*.
 
 ### C5. Forward fields we don't model
 - **Decision:** `extra="allow"`, so `top_p`, `tools`, `response_format`, and other fields reach the provider.
 - **Why:** Pydantic silently **drops** unknown fields by default, which would quietly break the "drop-in replacement" promise.
-- **Production terms:** *API compatibility*, *drop-in replacement*, *forward compatibility*.
 
 ---
 
-## D. Streaming (Phase 1)
+## D. Streaming
 
 ### D1. Pass the SSE stream through unchanged
 - **Decision:** forward every line the moment it arrives. The gateway only watches (TTFT and usage) and changes nothing.
 - **Why:** users see the first words in about 1 s instead of waiting for the whole answer.
-- **Production terms:** *Server-Sent Events (SSE)*, *time to first token (TTFT)*, *streaming proxy*.
-- **Read:** MDN, "Using server-sent events."
+- **References:** MDN, "Using server-sent events."
 
 ### D2. The gateway always asks for usage in streams
 - **Decision:** set `stream_options.include_usage = true` on every streamed request.
 - **Why:** OpenAI only sends token usage at the end of a stream if asked. Without it, cost tracking, budgets, and token limits can't see streamed requests.
-- **Production terms:** *usage metering*, *cost attribution*.
 
 ### D3. Usage logging always runs (`finally`)
 - **Decision:** the code that records usage runs in `finally:`, so it runs even when the client disconnects.
@@ -134,17 +115,15 @@ Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of eac
 - **Decision:** if the provider dies after chunks were sent, send `data: {"error": ...}` without `[DONE]`. The OpenAI SDK raises `APIError`.
 - **Alternatives:** regenerate with another provider and continue the stream.
 - **Why:** the 200 and part of the answer are already sent, and bytes can't be unsent. A regenerated answer gets **glued on** ("…within 30 Thanks for asking!…") because the OpenAI protocol has no "discard what you got" message. The gateway must not invent behavior the protocol doesn't have. The client knows its own context (show a "Regenerate" button, or retry a job).
-- **Production terms:** *response commit point*, *protocol compatibility*, *partial failure*.
 
 ### D5. Read ahead: commit only after the first chunk
 - **Decision:** for streams, wait for the provider's **first chunk** before sending 200 to the client.
 - **Alternatives:** commit as soon as the provider sends its headers.
 - **Why:** fallback is only possible before the first byte reaches the client. A provider that sends headers and then goes silent would otherwise leave us stuck.
-- **Production terms:** *commit point*, *buffering / read-ahead*.
 
 ---
 
-## E. Routing (Phase 2a)
+## E. Routing
 
 ### E1. Fallback chains live in a central config owned by the platform team
 - **Decision:** `config.yaml` maps each model name a client can request to an ordered list of `{provider, model}` targets.
@@ -153,59 +132,50 @@ Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of eac
   - a config sent with each request (Portkey's configs).
 - **Why:** 20 internal teams and leadership's cost goals call for central governance, and client code stays one line.
 - **Cons:** a team that needs a custom chain has to ask the platform team. A per-request override could be added later.
-- **Production terms:** *model routing*, *routing table*, *governance*, *control plane vs data plane*.
-- **Read:** the LiteLLM docs on proxy config (`model_list`) and on router fallbacks.
+- **References:** the LiteLLM docs on proxy config (`model_list`) and on router fallbacks.
 
 ### E2. Clients may send a vendor name **or** a tier name
 - **Decision:** both `gpt-4o-mini` and `fast` / `strong` are valid; the config decides the real model.
 - **Why:** vendor names keep existing code working (teams change only `base_url`). Tiers let teams say what they need without picking a vendor, and let us swap vendors later.
 - **Cons:** during a fallback, a request for `gpt-4o-mini` may be answered by Llama. **Reduced by** always reporting the real provider (`x-gateway-provider`) and model (`model` in the response).
-- **Production terms:** *model aliasing*, *model groups*, *vendor lock-in*.
 
 ### E3. An unknown model gets a 404 `model_not_found`
 - **Decision:** a model name that isn't in the config is rejected without calling any provider.
 - **Why:** the platform controls which models teams can use. It's also the same error OpenAI returns, so client code handles it.
-- **Production terms:** *allowlist*, *authorization*.
 
 ---
 
-## F. Failure handling (Phase 2b)
+## F. Failure handling
 
 **The core rule: is it the request's fault or the provider's?** Another provider can't fix a broken request, but it can answer when one provider is in trouble.
 
 ### F1. Request errors (400, etc.) are returned as-is: no retry, no fallback
 - **Alternatives:** retry (the same input gives the same error); fall back (a lenient provider might accept it, but that **hides the client's bug**).
 - **Later (v2):** some 400s are *model limits*, not client mistakes: context window too small, or a content-policy block. LiteLLM has `context_window_fallbacks` and `content_policy_fallbacks` for these.
-- **Production terms:** *4xx = client error, 5xx = server error*, *fail fast*.
 
 ### F2. Fallback is on by default; clients can opt out
 - **Decision:** `x-gateway-fallback: off` disables it for one request.
 - **Alternatives:** opt-in (off by default; the user's original idea); always on, with no flag.
 - **Why:** **the default decides what happens to everyone who doesn't read the docs.** With opt-in, the support bot is down again in the next outage. Teams that need an exact model (evals) can opt out.
 - **Industry:** OpenRouter falls back by default (`allow_fallbacks: false` turns it off). LiteLLM applies configured fallbacks automatically.
-- **Production terms:** *failover*, *graceful degradation*, *secure / safe defaults*, *opt-in vs opt-out*.
 
 ### F3. An upstream 401/403 is *our* problem: fall back, log at ERROR, and return 502 if nothing is left
 - **Alternatives:** pass the 401 through (the client then debugs their own valid key for hours).
 - **Why:** teams never send provider keys. The gateway uses **one shared OpenAI key**, so a 401 means *our* key is broken, for every team.
 - **Note:** in a **BYOK** design (each user sends their own provider key), a 401 would be that user's fault and should be passed through.
-- **Production terms:** *502 Bad Gateway* ("something behind the gateway failed"), *BYOK (bring your own key)*.
 
 ### F4. 429: fall back immediately; return 503 with `Retry-After` if nothing is left
 - **Alternatives:** wait and retry the same provider (LiteLLM does this, because it often has several deployments of one model).
 - **Why:** the 429 is for our **shared** account. Retrying in lockstep across all teams hammers the provider again, and falling back takes load off it.
-- **Production terms:** *retry storm*, *backpressure*, *`Retry-After` header*, *503 Service Unavailable*.
 
 ### F5. 5xx and connect errors: fall back immediately; on the last option, retry **once** with jitter, then 502
 - **Alternatives:** always retry first (slow during real outages); never retry (gives up on one-second glitches when there's no alternative).
 - **Why:** fall back fast when an alternative exists. Retry only when nothing else is left, after a random 100–300 ms wait so failed requests don't all retry at the same instant.
-- **Production terms:** *exponential backoff with jitter*, *retry budget*, *transient failure*.
-- **Read:** AWS Builders' Library, "Timeouts, retries, and backoff with jitter"; Marc Brooker, "Exponential Backoff and Jitter" (AWS Architecture Blog).
+- **References:** AWS Builders' Library, "Timeouts, retries, and backoff with jitter"; Marc Brooker, "Exponential Backoff and Jitter" (AWS Architecture Blog).
 
 ### F6. Read timeouts are never retried; 504 if nothing is left
 - **Why:** the provider *received* the request and may still be working on it, and billing us. Retrying a **slow** provider piles more requests onto it (a cascading failure). A connect timeout is different: the request was never sent, so it's safe to retry.
-- **Production terms:** *idempotency* (is it safe to do twice?), *cascading failure*, *504 Gateway Timeout*.
-- **Read:** Google SRE Book, "Addressing Cascading Failures" (free online).
+- **References:** Google SRE Book, "Addressing Cascading Failures" (free online).
 
 ### F7. Timeout values
 | Timeout | Value | Why |
@@ -214,11 +184,10 @@ Decided 2026-11-02 → 2026-11-03. The newest decisions are at the bottom of eac
 | Stream: first chunk | 10 s | Normally about 1 s, and until then we can still fall back |
 | Stream: gap between chunks | 30 s | A long silence means it's stuck |
 | Non-stream: whole answer | 60 s | Nothing arrives until the end, so slow and long look the same. That's the cost of not streaming. |
-- **Production terms:** *connect / read / total timeouts*, *time to first byte (TTFB)*, *deadline*.
 
 ---
 
-## G. Circuit breaker (Phase 2c)
+## G. Circuit breaker
 
 The problem: during a full outage, every request still tries the dead provider first and waits up to 3–60 s before falling back. At 300 RPS that means thousands of requests waiting on a provider we already know is dead.
 
@@ -239,21 +208,18 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Why:** it tests the real thing, and if the trial fails, that user still gets an answer through fallback. **Only one trial at a time**, because 300 simultaneous trials would knock a recovering provider straight back down.
 - **The trial can't get stuck:** a hung trial ends at the 2b timeouts and counts as a failure.
 - **v2:** a growing cooldown (30 s → 60 s → 120 s) for a provider that keeps failing its trials.
-- **Production terms:** *circuit breaker states: closed / open / half-open*, *cooldown*, *probe / trial request*.
 
 ### G4. Breaker state lives in each gateway copy's memory
 - **Alternatives:** share the state in Redis.
 - **Why:** with 3 copies, each one learns separately, so 15 wasted requests instead of 5. That's about 0.05 s of traffic at 300 RPS, and each of those requests still falls back. Sharing the state would add a Redis call to every request **and** make Redis a new way for the breaker itself to fail.
 - **Industry:** Envoy's outlier detection is per proxy instance. resilience4j and Polly keep state in memory by default.
-- **Interview line:** *"I deliberately didn't share breaker state, because the coordination cost more than the inconsistency."*
-- **Read:** Martin Fowler, "CircuitBreaker" (martinfowler.com/bliki/CircuitBreaker.html); Michael Nygard, *Release It!*, the book that popularized the pattern.
+- **References:** Martin Fowler, "CircuitBreaker" (martinfowler.com/bliki/CircuitBreaker.html); Michael Nygard, *Release It!*, the book that popularized the pattern.
 
 ### G5. One breaker per provider + model, not per provider
 - **Alternatives:** one breaker per provider.
 - **Why:** providers often have trouble with one model at a time. Per provider, a broken `gpt-4o` would also cut off a healthy `gpt-4o-mini`.
 - **Cons:** a full provider outage needs 5 failures *per model* before each breaker trips. That's a few more wasted requests, and each still falls back.
 - **Industry:** LiteLLM cools down per *deployment* (one model at one provider).
-- **Production terms:** *failure domain*, *blast radius*, *deployment*.
 
 ### G6. Implementation details that came out of building it
 - **When skipped, return `503` with `Retry-After`** set to the seconds left until the next trial, so clients know when to come back. We skipped the provider ourselves, so this is "temporarily unavailable" (503), not "bad gateway" (502).
@@ -264,29 +230,27 @@ The problem: during a full outage, every request still tries the dead provider f
 - *(Open)* **A provider dying mid-stream doesn't count as a breaker failure** (the stream already succeeded at its first chunk). Count it later if it turns out to happen often.
 - **Measured:** with a broken OpenAI key and fallback off, requests 1–5 took **0.3–0.75 s** each to fail at OpenAI. Requests 6–7 failed in **~1.3 ms**, because the breaker skipped OpenAI entirely.
 
-## H. Metrics (Phase 2d)
+## H. Metrics
 
 ### H1. Two dashboards: on-call health vs cost/usage
 - **Decision:**
   - **On-call dashboard, top row:** traffic (RPS), error rate (5xx as the client sees it), latency (p95 overall, and TTFT for streams). This is the **RED method**.
   - **On-call dashboard, second row (gateway-specific):** fallback rate, breaker state per deployment, requests in flight (saturation).
-  - **Cost/usage dashboard:** tokens and $ per model, and per team once Phase 3 adds team keys.
+  - **Cost/usage dashboard:** tokens and $ per model, and per team.
 - **Alternatives:** one dashboard with everything; or only latency, cost, and errors (the first pick).
 - **Why:**
   - Cost matters a lot (the 30% goal is worth about $400k a month), but it changes slowly. It's read daily or weekly by the platform team and finance, not at 3 a.m. It's a **business metric**, not an **operational** one.
   - **Traffic is required:** if no requests reach the gateway, errors read 0% and latency looks fine. Only RPS dropping to 0 shows it. It's also what makes an error count meaningful.
   - **Gateway-specific metrics catch hidden degradation:** when OpenAI is down but fallback covers it, the client error rate stays at 0%. Only the fallback-rate and breaker graphs show that every team is running on the backup model.
 - **Cons:** two dashboards to maintain.
-- **Production terms:** *RED method* (Rate, Errors, Duration), *Google's four golden signals* (latency, traffic, errors, saturation), *operational vs business metrics*, *SLI* (the measured number, e.g. % of non-5xx requests), *SLO* (the target, e.g. 99.9%), *degraded mode*.
 - **Read (only if needed):** Google SRE book, chapter 6 "Monitoring Distributed Systems" (sre.google/sre-book/monitoring-distributed-systems/); Tom Wilkie, "The RED Method" (Grafana blog).
 
 ### H2. Tool: Prometheus + Grafana
 - **Decision:** the gateway exposes `GET /metrics`; Prometheus scrapes it every 15 s; Grafana draws the dashboards. Both run locally with Docker Compose.
 - **Alternatives:** OpenTelemetry (push to a collector; also does tracing); Datadog / New Relic (paid SaaS agents).
 - **Why:** the open-source standard (LiteLLM, Envoy, and Kubernetes all expose `/metrics`), free, and anyone who clones the repo can run the same dashboard.
-- **Cons:** two more containers. Docker is needed now instead of in Phase 3 (Redis needs it anyway).
+- **Cons:** two more containers. Docker becomes a requirement (Redis needs it anyway).
 - **Later:** add OpenTelemetry if we want **traces** that follow one request through every step.
-- **Production terms:** *pull model / scraping*, *scrape interval*, *exposition format*, *time-series database (TSDB)*, *observability: metrics, logs, traces (the three pillars)*.
 
 ### H3. Which metrics, their types, and their labels
 | Metric | Type | Labels | Answers |
@@ -301,24 +265,22 @@ The problem: during a full outage, every request still tries the dead provider f
 | `gateway_tokens_total` | counter | deployment, kind | usage, and cost once we add prices |
 - **Types:** counter = only goes up (Prometheus computes the rate); gauge = goes up and down; histogram = buckets, for percentiles.
 - **Breaker state is one-hot** (one series per state, set to 1 or 0) instead of label-encoded 0/1/2, so "how many breakers are open" is a plain `sum`. This is Prometheus's *state set* pattern.
-- **Labels only with a small, fixed set of values.** Never `prompt` or `request_id`: each unique value is a new time series kept in memory (*cardinality explosion*), and `prompt` would also break the no-raw-prompts rule. Model names the client sends that aren't configured are labelled `unknown`, so a client can't create series. `team` comes in Phase 3 (about 20 values: fine).
+- **Labels only with a small, fixed set of values.** Never `prompt` or `request_id`: each unique value is a new time series kept in memory (*cardinality explosion*), and `prompt` would also break the no-raw-prompts rule. Model names the client sends that aren't configured are labelled `unknown`, so a client can't create series. `team` is fine as a label: about 20 values.
 - **Two model labels:** `model` is what the client asked for (`fast`); `deployment` is what we actually called (`openai/gpt-4o-mini`), the same name as the breakers.
 - **Buckets go up to 60 s.** The library defaults stop at 10 s, which suits web pages but not LLM calls.
 - **RED metrics come from an ASGI middleware**, because only something wrapping the whole response sees a stream's real end. The endpoint passes the model label through `request.state`.
 - **A provider dying mid-stream** is now visible as `outcome="mid_stream"` (the open item in G6). It still doesn't trip the breaker.
 - **One process per container** for now. With several uvicorn workers in one container, each worker has its own counters, and you'd need the client library's *multiprocess mode*.
-- **Not yet:** $ cost (needs prices in the config) and gateway overhead (the 20 ms target; it's measured in Phase 6 with a mock provider).
-- **Production terms:** *cardinality*, *time series*, *bucket*, *state set*, *instrumentation*, *middleware*.
+- **Not yet:** $ cost (needs prices in the config) and gateway overhead (the 20 ms target; measured with a mock provider in Q).
 - **Read (only if needed):** Prometheus docs, "Metric types" and "Instrumentation: Use labels" (prometheus.io/docs/practices/instrumentation/).
 
 ### H4. Local monitoring stack: Docker Compose, dashboards as code
 - **Decision:** `docker-compose.yml` runs Prometheus (scrapes `host.docker.internal:8000` every 15 s) and Grafana. Grafana's data source and both dashboards are **provisioned** from files in `monitoring/`, so `docker compose up -d` gives anyone the same dashboards with no clicking.
-- **The gateway stays on the host for now** (fast edit-restart loop). It moves into Compose in Phase 3, alongside Redis.
+- **At first the gateway ran on the host** (fast edit-restart loop). It moved into Compose later, alongside Redis (M).
 - **Alternatives:** build dashboards by clicking in Grafana (lost when the container is recreated, and can't be reviewed in a PR); Grafana Cloud (hosted, but needs an account).
 - **Queries worth knowing:** `rate(counter[1m])` turns a counter into per-second; `histogram_quantile(0.95, sum by (le) (rate(..._bucket[5m])))` gives p95; `increase(counter[1h])` gives a total over a window.
 - **Prometheus history lives in a named volume** (`prometheus-data`), so it survives `docker compose down`; `down -v` wipes it. Containers are disposable: anything that must survive lives in a mounted file or a volume. Production adds a *retention period* (Prometheus default: 15 days).
 - **Images pinned:** `prom/prometheus:v3.5.0`, `grafana/grafana:12.1.0`. Anonymous Viewer access is on for local use only.
-- **Production terms:** *provisioning*, *dashboards as code*, *PromQL*, *service discovery* (replaces our static target in Kubernetes).
 
 ### H5. Alert on TTFT and TPOT, not just total latency
 - **Decision:** add `gateway_tpot_seconds{deployment}` (histogram, buckets 5 ms–0.5 s per token), computed at the end of a stream as `(total − TTFT) ÷ (completion tokens − 1)`. Alongside TTFT, it's an on-call panel.
@@ -326,7 +288,6 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Cons:** streams only (a non-streamed answer arrives in one piece, so there's nothing to time per token); no TPOT if the client leaves before the usage chunk.
 - **Bucket resolution:** histogram percentiles are estimates *inside* a bucket (the measured p50 1.29 s and p95 1.93 s were both somewhere in the 1–2 s bucket). Add buckets where the distinction matters.
 - **Industry:** vLLM, TGI, and LLM benchmarking tools report TTFT and TPOT (also called *inter-token latency*, ITL) as their main latency numbers.
-- **Production terms:** *TTFT*, *TPOT / ITL*, *prefill vs decode*, *tokens per second*, *bucket resolution*.
 
 ## I. More providers: Anthropic adapter, Groq, Ollama
 
@@ -352,7 +313,7 @@ The problem: during a full outage, every request still tries the dead provider f
 
 ### I5. Streaming: translate events, commit at the first content block
 - Anthropic's events (`message_start`, `content_block_start/delta/stop`, `message_delta`, `message_stop`, `ping`, `error`) become OpenAI chunks. Thinking blocks are left out. Input tokens (from `message_start`, including cache reads and writes) and output tokens (from `message_delta`) are combined into the final `usage` chunk, so metrics and cost tracking work unchanged.
-- **Commit point:** nothing reaches the client until the model starts its first content block. Anthropic can send `message_start` and then report `overloaded_error` inside the 200 stream; because we haven't committed, that still falls back. *Production term:* *in-band errors*. TrueFoundry calls the same idea a "first-chunk gate".
+- **Commit point:** nothing reaches the client until the model starts its first content block. Anthropic can send `message_start` and then report `overloaded_error` inside the 200 stream; because we haven't committed, that still falls back. TrueFoundry calls the same idea a "first-chunk gate".
 - **Why the first content block, not the first text:** with thinking on, text can start long after our 10 s first-chunk timeout, which would cause needless fallbacks that cost money.
 - **After the commit point** an `error` event, or a stream that ends without `message_stop`, sends our usual error event with no `[DONE]` (D-section).
 
@@ -366,11 +327,9 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Four functions, one per direction:** `to_anthropic()` (request out), `from_anthropic()` (response back), `error_to_openai()` (error bodies back), `translate_stream()` (stream back).
 - **Streaming is a pipeline of async generators:** raw httpx lines → `translate_stream()` → read-ahead to the commit point → `relay_stream()` (TTFT, TPOT, usage) → client. Each stage only knows about the stage before it.
 - **What can't be translated is said out loud:** `Unsupported` for features Claude lacks, and `x-gateway-dropped-params` for fields we removed. Nothing is changed silently.
-- **Learned:** provider quirks show up in places you don't expect. Sampling parameters are now rejected, thinking tokens count toward `max_tokens`, cache tokens are reported separately, and errors can arrive inside a 200 stream. Read the provider's current docs before trusting memory.
-- **Production terms:** *adapter pattern*, *schema mapping*, *anti-corruption layer* (a translation boundary that keeps another system's model out of yours), *canonical format*, *stream transformation*, *in-band errors*.
-- **Interview line:** *"Provider differences are isolated in adapters at the bottom of the call path. Routing, fallback and circuit breaking only see one canonical format, so adding a provider never touches them."*
+- **What came up:** provider quirks show up in places you don't expect. Sampling parameters are now rejected, thinking tokens count toward `max_tokens`, cache tokens are reported separately, and errors can arrive inside a 200 stream. Read the provider's current docs before trusting memory.
 
-## J. Team API keys (Phase 3)
+## J. Team API keys
 
 ### J1. Keys are generated by the gateway and stored only as SHA-256 hashes
 - **Decision:** the gateway generates every key (a prefix plus 32 random characters; teams never choose their own). The database stores only the key's **SHA-256 hash** plus a short visible prefix, so people can tell keys apart. The full key is **shown once**, at creation, and never stored. On each request the gateway hashes whatever key arrives and looks the hash up.
@@ -380,7 +339,6 @@ The problem: during a full outage, every request still tries the dead provider f
 - **What hashing doesn't protect:** keys in transit (TLS covers that) and keys inside a compromised gateway (the answer there is revocation, rotation, and never logging keys).
 - **Industry:** Stripe, OpenAI and GitHub all hash keys and show them once; that's why their dashboards only show part of each key.
 - **Optional extra, not needed for random keys:** HMAC-SHA256 with a secret *pepper* kept outside the database.
-- **Production terms:** *hashing*, *defense in depth*, *show-once secrets*, *entropy*, *offline / dictionary attack*, *key derivation function*, *Kerckhoffs's principle*, *data at rest vs in transit*, *revocation*, *rotation*, *threat model*.
 - **Prefix: `sbk_`** (switchboard key), e.g. `sbk_8f3kQ9x2Lm7v...`. It's distinctive, so *secret scanning* can match it with few false alarms (OpenAI's `sk-` is shared by many providers). It uses an underscore so a double-click selects the whole key (GitHub switched to `ghp_` for this), and it's short.
 
 ### J2. Postgres as the source of truth, an in-process cache for every request
@@ -389,7 +347,6 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Why memory and not Redis for the cache:** keys are read 300 times a second and change rarely (a *read-heavy workload*). A memory lookup takes about a microsecond and can't go down. Redis is kept for data that must be shared right away, like rate-limit counters.
 - **Cons:** a revoked key keeps working until its cache entry expires on every gateway copy. One more container (Postgres, with a named volume for its data).
 - **Industry:** LiteLLM stores its virtual keys in Postgres with a cache in front.
-- **Production terms:** *source of truth*, *cache-aside*, *in-process cache*, *negative caching*, *relational database*, *ACID transactions*, *write-ahead log (WAL)*.
 - **Cache expiry: 60 s for valid keys, 10 s for invalid ones.** A leaked key takes a person minutes or hours to notice, so 60 extra seconds barely matter, and Postgres stays nearly idle (about 100 keys × 3 gateway copies ÷ 60 s ≈ 5 queries a second, roughly a 98% hit rate). Invalid entries expire faster, so a new key works quickly even if someone tried it just before it was created.
 - **No sticky sessions needed:** each gateway copy fills its own cache, so the load balancer can send a request anywhere (round-robin, least connections). A miss just costs about 1 ms, on a pooled connection.
 
@@ -402,7 +359,6 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Schema:** created by `scripts/setup_db.py` with `CREATE TABLE IF NOT EXISTS`, run as the database owner (M3); the gateway only checks the tables exist. **v2:** a migration tool (Alembic) once the schema starts changing.
 - **Driver:** asyncpg with a pool of 1-5 connections and a 2 s query timeout. Opening a new connection per query would cost 5-20 ms.
 - **Tests** use an in-memory fake key store, so they need no Postgres. The real path was checked by hand against Postgres in Docker.
-- **Production terms:** *fail closed*, *stale-if-error*, *soft delete*, *schema migration*, *connection pool*, *FastAPI dependency*.
 
 ### I8. First real fallback, and what it taught us
 - **Test:** a gateway copy with a deliberately broken OpenAI key, sending real requests. Requests 1–5: OpenAI 401 → Groq 200 (`x-gateway-attempts: openai:auth`). Request 6: OpenAI skipped by its breaker (`openai:circuit_open`). Streaming fell back too, with usage reported at the end.
@@ -411,12 +367,11 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Reasoning models count reasoning in `max_tokens`:** for "Say hi", Groq's gpt-oss-20b used 98 of 111 output tokens on reasoning. A small `max_tokens` can return an empty answer. The same applies to Claude's thinking (I2).
 - **Free-tier latency is mostly queueing:** Groq reported 0.7–1.1 s of `queue_time` and about 0.1 s of generation.
 
-## K. Rate limits (Phase 3b)
+## K. Rate limits
 
 ### K1. Counters live in Redis, not in each gateway copy
 - **Problem:** with 3 gateway copies each counting in its own memory, a "100 per minute" limit really allows about 300. The real number changes whenever we add or remove copies, and an uneven load balancer can reject a team on one copy while the others sit idle.
 - **Decision:** one shared counter per team in **Redis**. A call takes well under a millisecond on a local network, and Redis runs each command (or Lua script) by itself, so two gateway copies can't both read "99" and both let a request through.
-- **Production terms:** *distributed rate limiting*, *shared state*, *atomic operation*, *race condition*.
 
 ### K2. Algorithm: token bucket
 - **How it works:** each team has a bucket with a **capacity** (the biggest burst allowed) that refills at a steady **rate** (the long-term limit). A request takes coins from the bucket; an empty bucket means `429`. The bucket never fills past its capacity, so an idle team can't save up a huge allowance.
@@ -427,7 +382,6 @@ The problem: during a full outage, every request still tries the dead provider f
   - *Sliding window counter* (this window's count plus a weighted share of the last one's): close to exact with two counters. Cloudflare uses it. A fine choice, but it has one dial instead of two.
 - **Why the bucket:** burst size and steady rate are separate dials; it stores two numbers per team however busy the team is; and a request can take **many coins at once**, which is what limiting LLM tokens needs (K3). OpenAI's and Anthropic's limits behave like this (they refill continuously rather than resetting on the minute), so teams already understand our 429s.
 - **Industry:** Stripe (token bucket in Redis), AWS API Gateway (token bucket), Cloudflare (sliding window counter).
-- **Production terms:** *token bucket*, *leaky bucket*, *burst capacity*, *refill rate*, *lazy refill*, *Lua scripting in Redis*.
 
 ### K3. Limit both requests per minute and tokens per minute
 - **Decision:** two buckets per team, **RPM** (each request costs 1) and **TPM** (each request costs its tokens). A request has to pass both.
@@ -438,7 +392,6 @@ The problem: during a full outage, every request still tries the dead provider f
   - *Charge afterwards* (check the bucket isn't empty, subtract the real usage when the response ends): exact, but a 200k-token prompt is only noticed after we've paid for it.
   - *Estimate, then settle:* take an estimate of the prompt (about 4 characters per token, no tokenizer needed) before calling the provider, then charge or refund the difference once the provider reports real usage. The bucket can go below zero, and a team in debt waits until it refills.
 - **Decision: estimate, then settle.** It costs the same two Redis calls as charging afterwards, rejects a huge prompt before it costs anything, and ends up exact. Many requests in flight at once can still each pass while the bucket is positive. The RPM bucket bounds that.
-- **Production terms:** *RPM / TPM*, *reservation and reconciliation*, *estimate-then-settle*, *token debt*.
 
 ### K4. Redis down: fail open, onto a smaller limit in each copy
 - **Decision:** if Redis can't be reached, each gateway copy switches to a bucket in its own memory, with the team's limit divided by `gateway_copies` (from config.yaml). It logs one ERROR, sets the `gateway_rate_limit_degraded` gauge to 1, and tries Redis again every 5 seconds. Once Redis answers, it logs that and goes back to shared limits.
@@ -446,8 +399,7 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Why not unlimited:** the per-copy bucket is the old "each copy counts on its own" problem, but split by the number of copies it's close enough for a few minutes. It reuses the same bucket code.
 - **What still protects us during the outage:** auth (only real teams get in), budgets in Postgres (3c), and the providers' own limits, which our fallback already handles.
 - **Industry:** Envoy's rate limit filter lets requests through by default when its rate limit service is down (`failure_mode_deny: false`).
-- **Interview line:** fail closed on security checks, fail open on protection checks, and make the degraded mode visible.
-- **Production terms:** *fail open*, *graceful degradation*, *single point of failure*, *blast radius*.
+- **The rule:** fail closed on security checks, fail open on protection checks, and make the degraded mode visible.
 
 ### K5. How it's built
 - **Where it runs:** first thing in the chat endpoint, right after auth and before the model lookup, the cache and the providers.
@@ -462,16 +414,14 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Redis client:** `redis-py` 7 (`redis.asyncio`) with 100 ms timeouts, since a healthy Redis answers in well under a millisecond. It connects lazily, so the gateway starts even if Redis is down.
 - **Tests** use `fakeredis`, which runs the real Lua script, plus a test that runs the same steps through the Lua and the Python fallback and checks that they agree.
 - **Checked against real Redis:** with a 3 per minute limit, requests 1–3 got 200 and request 4 got 429 with `Retry-After: 15`. After stopping Redis, requests went on working with local limits, the degraded gauge went to 1, and one ERROR was logged. After restarting Redis, the gateway went back to the shared bucket, and the bucket still remembered the usage from before the outage (the named volume kept it).
-- **Production terms:** *Lua script*, *atomicity*, *clock skew*, *lazy connection*, *key expiry (TTL)*.
 
-## L. Budgets (Phase 3c)
+## L. Budgets
 
 ### L1. A warning amount and a hard stop, as two dollar numbers
 - **Decision:** each team has `soft_usd` and `max_usd` per month, in `config.yaml`. Past `soft_usd`: one WARNING log line per month, Prometheus alerts, and requests still work. At `max_usd`: `429` with `code: budget_exceeded` and `type: insufficient_quota` (OpenAI's word for "out of credit"), until the month resets on the 1st at 00:00 UTC.
 - **Why both:** a hard stop alone breaks a production service on the 28th. Warnings alone never stop a runaway loop at 2 a.m. The soft amount gives days of notice, and the hard stop caps the damage.
 - **Why two numbers, not "budget plus 20%":** "warn at $500, stop at $600" is easier to read than a percentage, and it's how LiteLLM does it (`soft_budget`, `max_budget`).
 - **Industry:** LiteLLM (`soft_budget` alerts, `max_budget` rejects, `budget_duration` resets), Portkey (alert threshold by email, then the key stops), OpenRouter (per-key credit limits that reset daily, weekly or monthly at midnight UTC), AWS Budgets (alerts at chosen percentages, actions optional). They all warn first and stop later, and they all reset on a UTC schedule.
-- **Production terms:** *soft limit vs hard limit*, *chargeback / showback*, *budget period*.
 
 ### L2. What a request costs
 - **Prices** live in `config.yaml` as USD per million tokens, the unit providers publish, copied from each provider's pricing page. A configured model without a price stops startup, the same rule as missing API keys. Otherwise its spend would count as $0 and no budget could stop it. (Portkey documents exactly this gap: models without pricing don't count towards budgets.)
@@ -481,7 +431,6 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Money is an integer number of micro-dollars** (1 = $0.000001), never a float. Floats can't hold amounts like $0.0004 exactly, and sums of millions of them drift. "$X per 1M tokens" is exactly "X micro-dollars per token", so the maths is tokens × price, in `Decimal`, rounded once per request. Rounding is at most half a micro-dollar per request, which comes to $0.50 per million requests.
 - **The Anthropic adapter now keeps the cache split:** cache reads go in `prompt_tokens_details.cached_tokens` (OpenAI's field), and cache writes in `prompt_tokens_details.cache_creation_tokens`, our own field, since OpenAI has none. Before this, both were added into `prompt_tokens`, which lost the information pricing needs.
 - **Known gaps:** Haiku 5.5's higher price for prompts over 100k tokens isn't modelled. Ollama is $0, though its GPU isn't free. We track list prices; committed-use discounts get reconciled against the real invoice by finance.
-- **Production terms:** *list price*, *fixed-point money*, *price snapshot*.
 
 ### L3. Postgres ledger as the source of truth, Redis as a cache of the total
 - **Decision:** one row per request in an append-only `usage_ledger` table: team, key, requested model, deployment that answered, the four token counts, cost in micro-dollars, and whether the cost was estimated. Rows are added, never changed. Each gateway copy buffers rows in memory and writes them with one `COPY` every second.
@@ -494,7 +443,6 @@ The problem: during a full outage, every request still tries the dead provider f
   - a gateway copy that crashes loses up to about 1 s of its unwritten rows (a clean shutdown writes them);
   - a rebuilt total misses the rows still in the buffer, about 1 s of traffic, until the next rebuild;
   - a request that starts just under `max_usd` can end above it, by at most one request's cost per request in flight.
-- **Production terms:** *append-only ledger*, *event sourcing (lite)*, *derived view*, *write batching*, *cache rebuild*, *source of truth*.
 
 ### L4. When things fail
 - **Redis down:** the check is skipped (fail open, the same reasoning as K4), and the response has no budget headers instead of made-up numbers. Rows still go to Postgres, so nothing is lost, and the next rebuild catches up.
@@ -510,7 +458,7 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Checked for real:** Postgres, Redis and OpenAI, with a $0.00001 soft budget and a $0.00003 max. Each "Say hi" cost 4 micro-dollars (9 input + 5 output tokens on gpt-4o-mini). The spend header climbed 0 → 4 → 8 … → 28 µ$, the warning was logged once at 12 µ$, and request 9 got 429 at 32 µ$, overshooting by one request as expected.
 - **Bug the real test found:** Postgres's `SUM()` of a `BIGINT` returns a `NUMERIC`, which asyncpg turns into a `Decimal`, and Redis refused to store it. The fake ledger returned an `int`, so the tests couldn't see this. Fail open did its job: all 10 requests still landed in the ledger. The fix is to convert to `int`. **Lesson:** a fake can hide the real driver's types. That's why each phase also gets a real run.
 
-## M. Running everything in Docker (Phase 3d)
+## M. Running everything in Docker
 
 ### M1. One image, many copies
 - **Decision:** a `Dockerfile` builds the gateway image (`python:3.12.16-slim`, 256 MB). Compose runs it with `replicas: 3`. Each container runs **one uvicorn process**; to scale, you run more containers, not more processes per container. That way each copy is one thing to health-check, restart and count, which is how Kubernetes and ECS expect it.
@@ -520,7 +468,6 @@ The problem: during a full outage, every request still tries the dead provider f
   - **`.dockerignore` keeps `.env` out of the image.** Secrets are passed in at runtime with `env_file`; production would use a secrets manager.
   - **`HEALTHCHECK` calls `/healthz`,** so `docker compose ps` shows `healthy` or `unhealthy`.
   - **`CMD` is in exec form,** so uvicorn is process 1 and gets `docker stop`'s SIGTERM directly. It stops taking new requests and finishes the ones in flight (*graceful shutdown*).
-- **Production terms:** *container image*, *immutable artifact*, *horizontal scaling*, *replica*, *graceful shutdown*, *SIGTERM*, *health check*, *layer caching*.
 
 ### M2. nginx in front, round-robin
 - **Decision:** `nginx:1.30.6-alpine` is the only published port (`:8000`). The gateway copies have no ports of their own and are reachable only on Docker's internal network.
@@ -532,7 +479,6 @@ The problem: during a full outage, every request still tries the dead provider f
   - **`/metrics` returns 404 from outside (J3).**
 - **When a copy dies:** nginx gets "connection refused" and tries the request on another copy. It does this only when the request never reached a gateway, so a POST is never sent twice.
 - **Why nginx:** it's simple and everywhere. Kubernetes would give the same thing with a Service and an Ingress. Envoy or HAProxy would also work.
-- **Production terms:** *reverse proxy*, *load balancer*, *round-robin*, *service discovery*, *DNS-based discovery*, *upstream keepalive*.
 
 ### M3. Least privilege in Postgres
 - **Decision:** two database logins.
@@ -542,7 +488,6 @@ The problem: during a full outage, every request still tries the dead provider f
 - **Schema setup moved out of gateway startup** into `scripts/setup_db.py`, since `gateway` isn't allowed to create tables. It runs as a one-off `db-setup` container, and the gateway copies wait for it to exit successfully (`service_completed_successfully`). Postgres gets a `pg_isready` health check so setup waits for a database that is actually ready, not just a started container. The gateway checks at startup that its tables exist and refuses to start with a clear message if they don't.
 - **The script can run again safely:** `CREATE ... IF NOT EXISTS`, and the role is only created if it's missing. The password is quoted with Postgres's own `format('%L')`, since DDL can't take `$1` parameters.
 - **In production:** the owner wouldn't be a superuser, passwords would come from a secrets manager, and the setup step would be a migration tool (Alembic) run by the deploy pipeline.
-- **Production terms:** *least privilege*, *GRANT*, *separation of duties*, *migration job*, *init container*.
 
 ### M4. Prometheus scrapes each copy, not the load balancer
 - **Decision:** `dns_sd_configs` on the name `gateway` gives Prometheus one target per copy. Through the load balancer, each scrape would hit a random copy, and counters would jump between three different values.
@@ -564,7 +509,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 
 **Still to do:** Ollama's `base_url` is `localhost:11434`, which inside a container means the container itself. When Ollama is installed, it becomes `host.docker.internal:11434`.
 
-## N. Exact response cache (Phase 4a)
+## N. Exact response cache
 
 ### N1. Off unless the team asks, and the key is everything that can change the answer
 - **Who decides:** the team, not the gateway. Each team has a default in `config.yaml` (`cache.default` is off), and the `x-gateway-cache: on | off` header overrides it per request. `x-gateway-cache-ttl: <seconds>` sets how long the answer is kept (default 1 hour, at most 7 days).
@@ -574,7 +519,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **`stream` isn't in the key:** a streamed request and a normal one share an entry. A stream is stored as the complete answer it adds up to, and a streaming request that hits gets the stored answer replayed as SSE chunks, ending with `[DONE]`.
 - **The team is in the key:** with one shared cache, team A could get team B's stored answer, which might contain customer data, and whoever sends a prompt first would decide everyone's answer (*cache poisoning*). A shared cache would get more hits, but not worth a data leak. Users inside a team share entries; prompts with per-user data differ, so they don't collide.
 - **Industry:** Helicone (off unless `Helicone-Cache-Enabled: true`), Cloudflare AI Gateway (`cf-aig-skip-cache`, `cf-aig-cache-ttl`), LiteLLM (per-request `cache: {"no-cache": true}`), Portkey (`cache: {mode, max_age}` in a config). All of them: opt-in, per-request control, a TTL.
-- **Production terms:** *cache key*, *canonicalisation*, *opt-in caching*, *cache poisoning*, *tenant isolation*, *fail safe (miss over wrong hit)*.
 
 ### N2. What gets stored
 - **Only complete answers:** every choice finished with `stop` or `tool_calls`.
@@ -594,7 +538,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **LFU over LRU:** LRU keeps whatever was used *last*, so one batch job sending 100,000 one-off prompts pushes every popular answer out (*cache pollution*). LFU keeps what's used *often*: a one-off prompt is the first to go.
 - **Failure:** if `redis-cache` is down, every lookup is a miss and requests go to the provider as usual (fail open, one ERROR log, retried every 5 s). Rate limits are unaffected, because they live in the other Redis.
 - **Production rule:** data with different durability needs goes in different stores. Isolation of failures comes with it.
-- **Production terms:** *TTL / expiry*, *eviction policy*, *LRU vs LFU*, *cache pollution*, *maxmemory*, *noeviction*.
 
 ### N4. What a hit costs, and what people see
 - **Budget:** a hit costs the team $0. It still gets a ledger row, with `cache_hit = true`, `cost_micros = 0`, and `saved_micros`: what it would have cost at the list price of the model that originally answered. That's how the cache's saving is measured instead of claimed (*showback*). The two columns were added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, run by `scripts/setup_db.py`.
@@ -625,13 +568,12 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 | Ledger | the miss cost 4 µ$; each hit cost 0 and recorded `saved_micros = 4` |
 | `redis-cache` stopped | all requests 200, as misses; one ERROR per copy |
 
-## O. Semantic cache (Phase 4b)
+## O. Semantic cache
 
 ### O1. What it is, and why it's dangerous
 - **The idea:** a question that means the same as a stored one gets the stored answer. "capital of france" and "What's the capital of France?" share an entry. Each question is turned into an embedding (1,536 numbers), and the closest stored one is served if its similarity is at least the team's threshold.
 - **The danger:** embeddings measure how *related* two texts are, not whether they ask the *same thing*. Measured with `text-embedding-3-small` (O7): "Can I get a refund after 30 days?" vs "...within 30 days?" scores **0.958**, higher than any real paraphrase in our set; "Convert 10 miles to kilometers" vs the reverse scores 0.940. A wrong pair can outscore a right one, so no threshold is safe for every kind of question. It's unsafe for negation, numbers and IDs, names, personal or live data, and code; it suits FAQ-style questions with fixed answers.
 - **So it's a classifier:** it decides "same question or not", and it's evaluated like one. A wrong hit (*false positive*) answers a question nobody asked. A missed hit (*false negative*) only costs the normal price. *Precision* = how many served hits were right; *recall* = how many real repeats were caught. A higher threshold buys precision with recall.
-- **Production terms:** *semantic cache*, *embedding*, *cosine similarity*, *false positive / false negative*, *precision / recall*.
 
 ### O2. Off by default, three modes, a threshold per team
 - **Per team, in `config.yaml`:** `cache.teams.<team>.semantic: off | shadow | on` and `threshold`. *(Since O10: `on` always means the judge decides, and `threshold` is where a match becomes a candidate for it, default 0.70.)* It only runs when the exact cache is on for that request too, so `x-gateway-cache: off` turns off both.
@@ -640,7 +582,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **Picking the threshold** is the team's call, because only the team knows what a wrong answer costs them. The gateway's job is to give them numbers: `scripts/semantic_eval.py` takes labelled pairs (hand-written, or exported from shadow mode and labelled) and prints hit rate and precision at each threshold. The team states a limit ("at most 1 wrong per 100 hits") and gets the **lowest** threshold that meets it, since anything stricter throws savings away. If no threshold gives enough hits at that precision, the answer is to leave it off.
 - **Industry:** LiteLLM and RedisVL expose a threshold you set yourself (LiteLLM's docs use 0.8); Kong has a semantic cache plugin; Portkey picks a strict threshold and doesn't let you change it; Cloudflare AI Gateway and Helicone only do exact matching. Most products ship the knob and leave measuring it to you. The golden set and shadow mode are standard practice for launching any classifier, not a gateway feature. Research goes further: vCache (ICLR 2026) learns a threshold per stored prompt to stay under an error rate the user picks.
 - **v2:** check ~1% of served hits by calling the provider anyway and having an LLM judge compare the answers, for a running wrong-hit rate per team, with automatic switch-off above the team's limit. And count "rephrased or retried with the cache off right after a hit" as a cheap signal of a wrong hit.
-- **Production terms:** *shadow mode*, *golden dataset*, *precision/recall trade-off*, *LLM-as-judge*, *kill switch*.
 
 ### O3. What gets compared: only the last user message, inside an exact partition
 - **Partition:** a SHA-256 of the team, the embedding model, and the whole request except the last message (and except `stream`, `stream_options`, `user`, as in N1). Model, system prompt, temperature, tools and earlier turns all have to match **exactly**; only the last user message is compared by meaning. "Same question, different system prompt" is never a hit.
@@ -657,7 +598,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   - **Connection reuse isn't the fix:** httpx drops idle connections after 5 s, so a quiet copy opens a new one each time, but that costs only ~50 ms here. Keeping them open longer made it worse: after 20 s idle a reused connection took 1,174 ms, probably because OpenAI had already closed its end.
   - **a circuit breaker** (the same class as for providers): after 3 failures in a row, skip embedding for 30 s, so a dead embeddings API costs 0 ms per request, not 500 ms. A timeout bounds the damage to one request; a breaker stops you paying it again and again.
 - **Fail open, as everywhere in the cache:** embedding down, Redis down or the index missing all mean a miss.
-- **Production terms:** *cascading failure*, *timeout budget*, *circuit breaker*, *fail open*.
 
 ### O5. Vectors in `redis-cache`, with Redis's own vector search
 - **Where:** the `redis-cache` we already run. Redis 8 has vector search built in (`FT.CREATE ... VECTOR`), so there's no new service, and it keeps N3's property: the cache is disposable, losing it means misses. A vector database (Qdrant, pgvector) would add a service for no gain at this size.
@@ -665,7 +605,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **Search:** `@partition:{...}=>[KNN 1 @vector $vec]`: the closest stored question *in this partition only*, by cosine distance (similarity = 1 − distance).
 - **FLAT index (exact search), not HNSW (approximate).** With 256 MB there are at most tens of thousands of entries, and the partition filter cuts that to a handful, so a brute-force scan takes well under a millisecond. **v2:** HNSW if the cache grows to millions.
 - **The index lives in memory with no persistence,** so it's created on first use and again if a lookup finds it missing (after a `redis-cache` restart).
-- **Production terms:** *vector search*, *KNN*, *pre-filtering*, *FLAT vs HNSW (exact vs approximate nearest neighbour)*.
 
 ### O6. What a semantic hit costs, and what people see
 - Same as an exact hit (N4): $0 to the team, a ledger row with `cache_hit` and `saved_micros`, one request from the rate limit and the token estimate refunded.
@@ -687,7 +626,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **What it means:** at 0.95 this model catches no real paraphrase and still serves one wrong answer. For questions like these, the answer is "leave it off", and the tool says so.
 - **What it doesn't mean:** the near-misses are deliberately adversarial, and they're half the set. In real traffic most stored questions are unrelated to the new one (they score far lower), and the closest match is more often a true repeat, so real precision would be higher. That's exactly what shadow mode on a team's real traffic is for, and why the threshold is never picked from a made-up table. *(An earlier version of these notes used made-up numbers where 0.95 caught 15% of traffic. The real measurement was very different.)*
 - **Where to go from here, if a team needs it:** a model trained for "same question or not" rather than "related" (a *cross-encoder* or *reranker* that reads both questions together, or an embedding model fine-tuned on question pairs), or an LLM check of each candidate hit before serving it. Both cost latency on every candidate, and both should be measured with the same script.
-- **Production terms:** *offline evaluation*, *hard negatives*, *score distribution overlap*, *cross-encoder / reranker*.
 
 ### O8. Tests and the real check
 - **29 semantic tests:** what goes into the partition (everything but the question, including the team and the embedding model); which requests can't use it; a paraphrase is served and costs $0; a related question under the threshold is a miss; the threshold is the team's; shadow mode never serves and keeps pairs under the threshold too; an exact hit needs no embedding; `x-gateway-cache: off` turns off both; slow embeddings, a failing embeddings API (the breaker stops calling after 3), the vector store down and a lost index are all misses; bad config stops startup, and YAML's bare `on`/`off` work.
@@ -724,7 +662,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 - **Overfitting check:** a first prompt listed the traps ("different numbers, places, dates, or opposite actions mean no"). That's tuning on the test set. The neutral prompt did as well or better (100% / 90% vs 95% / 95%), so the result isn't the hints.
 - **What it costs:** money is small (~80 input tokens, 1 output: about 6% of a typical gpt-4o-mini call). Time isn't: embedding (~350 ms) plus judge (~660 ms) is about 1 s. A judged hit still beats a 3-5 s answer, but a judged *miss* is 1 s slower than no cache at all. Running the judge only in the grey zone keeps that to requests that have a candidate at all.
 - **Limits:** 40 pairs, written by hand, short and clean. Real questions are messier. It's a direction, not a result: the next step would be the judge in shadow mode on real traffic, labelled, before serving anything it approves.
-- **Production terms:** *two-stage retrieval (retrieve, then rerank/verify)*, *cross-encoder vs bi-encoder*, *LLM-as-judge*, *domain shift*, *overfitting to the test set*.
 
 ### O10. The judge decides; the embedding only finds a candidate
 - **Decision:** `semantic: on` means: the embedding finds the closest stored question; if its similarity is at least the team's `threshold` (default **0.70**), gpt-4o-mini reads both questions and the stored answer is served only if P("yes, the same question") is at least **0.9**. There's no "serve on the score alone" zone: wrong pairs scored up to 0.958 (O7), so no score is high enough.
@@ -746,7 +683,6 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 
   Metrics: 4 judge calls, 2 approved, 2 rejected; judge 0.70 s and embedding 0.46 s on average. In shadow mode the same pairs were saved with verdicts 1.0 and 0, and nothing was served.
 - **Tests:** 31 semantic tests. Mutation checks: ignoring the judge's "no", never asking it, ignoring the threshold, and adding "yes" and "no" probabilities together each made tests fail.
-- **Production terms:** *two-stage retrieval*, *verifier*, *LLM-as-judge*, *logprobs as confidence*, *break-even analysis*.
 
 ### O11. The same experiment on public data: 500 Quora Question Pairs
 - **Why:** O7 and O9 used 40 pairs I wrote myself, half of them traps. A fair objection is "you built a test the embedding would fail." So, the same comparison on pairs nobody here wrote: 500 random pairs from the GLUE QQP **validation** split (195 labelled duplicate, 305 not), 2026-11-17. The validation split, because the cross-encoder was trained on QQP's training split.
@@ -795,7 +731,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   3. **The LLM judge is the most robust, not perfect,** and the slowest (~650 ms). Its weak spot, who-did-what-to-whom swaps in long sentences, is rarer in short user questions than in PAWS, but not absent ("convert miles to km" vs "km to miles").
   4. Which is why the gateway ships it off by default, with shadow mode, and why a team's own labelled pairs are the test that counts.
 
-## P. Model routing: `auto` (Phase 5a)
+## P. Model routing: `auto`
 
 ### P1. A router, not a cascade
 - **The two options:**
@@ -882,7 +818,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
 
 ---
 
-## Q. Load testing, and what it found (Phase 6)
+## Q. Load testing, and what it found
 
 ### Q1. How it's measured
 - **What:** the gateway's **overhead**, the time it adds on top of the provider. Real providers take 1-10 s and vary a lot, which would hide a few milliseconds and cost money. So a **mock provider** (`loadtest/mock_provider.py`) answers after a delay we set: 300 ms to the first token, then 40 more tokens at 50 per second, 1.08 s in all. Run the same load straight at the mock and through the gateway, and subtract. Percentiles are subtracted from percentiles (gateway p99 - mock p99): "the gateway made the slow tail this much worse", not the overhead of any one request.
@@ -902,7 +838,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   - **`max_connections` in `config.yaml`, default 1,000**, sized by Little's Law (200 RPS × 5 s answers = 1,000). There is still a limit: without one, a provider that slows down lets connections pile up until the copy runs out of memory.
   - **A full pool is our overload, not the provider's failure:** a new failure kind, `overloaded`. It leaves the breaker alone, doesn't fall back (every target shares the same pool), waits 1 s at most instead of 5, and returns **503 `gateway_overloaded` with `Retry-After: 1`**, so the client can retry, likely on another copy.
 - **Not done here: one pool per provider** (*bulkhead*). The pool was shared, so one slow provider could take every connection and starve the healthy ones. The chaos test showed exactly that, and R2 added it.
-- **Production terms:** *Little's Law*, *cascading failure*, *bulkhead*. The general lesson: a breaker must only count failures that are the dependency's fault.
+- **The general lesson:** a breaker must only count failures that are the dependency's fault.
 
 ### Q3. httpcore's pool used 88% of the CPU: aiohttp underneath, httpx on top
 - **What happened:** with the pool fixed, 150 RPS was fine and 200 RPS sent the CPU to 100% and p50 to 14.8 s.
@@ -932,7 +868,7 @@ All tests used a model name that doesn't exist, so the rate limiter, which runs 
   - **Target 100 ms** (`overload_target_ms`). 50 ms refused 21% of requests at 600 RPS, a load the copy served without shedding at p99 1.76 s; 100 ms refused 5% there. Over the knee both behaved the same.
 - **Where it helps and where it can't** (final runs, Q6): it works for LLM traffic. At 400 streamed RPS, answered streams kept a TTFT p50 of 560 ms and the overflow got an instant 503 (p99 was 5.7 s in the final run and 1.2 s in an earlier one: at twice the knee the tail still varies a lot). But refusing still costs a TCP read, uvicorn's HTTP parsing and a 503, and a cache hit costs only about twice that. At 1,200 cache-hit RPS the copy spent its CPU refusing, requests queued *before* our middleware where the clock can't see them, and answered hits still took 1.4 s. **Shedding in the app only helps when serving costs much more than refusing.** For floods of cheap requests, stop them earlier: the load balancer (nginx `limit_req` / `limit_conn`) or more copies.
 - **Metrics:** `gateway_own_seconds` (the gateway's own time per request: also the overhead, live) and `gateway_shed_total`.
-- **Production terms:** *load shedding*, *admission control*, *CoDel*, *sojourn time*. Further reading: Google SRE book, "Handling Overload"; Netflix's `concurrency-limits` library.
+- **References:** Google SRE book, "Handling Overload"; Netflix's `concurrency-limits` library.
 
 ### Q6. Results
 One copy, one CPU, final build. "+" is over the mock alone (non-streamed p50 1,081 ms / p99 1,088 ms; streamed TTFT p50 301 ms / p99 311 ms). Latency is for answered requests only; shed requests are counted, not timed. 0 failed requests in every run.
@@ -986,7 +922,7 @@ One copy, one CPU, final build. "+" is over the mock alone (non-streamed p50 1,0
   1. A 20 s answer is under the 60 s read timeout, so it counts as a success. No fallback, and the breaker never counts a failure.
   2. Little's Law: 100 requests/s × 21 s = 2,100 in flight, and the pool has 1,000. Once it filled, requests got 503 `gateway_overloaded`.
   3. Both providers share the pool, so the healthy one sat idle while the slow one held every connection.
-- **The lesson:** a provider that's down is easy. Errors and dropped connections are caught by the rules from Phase 2. A provider that is slow but still answering looks healthy to every rule we had. Lowering the timeout doesn't fix it: a long answer can take 30-60 s, so a timeout can't tell slow from stuck.
+- **The lesson:** a provider that's down is easy. Errors and dropped connections are caught by the rules in F. A provider that is slow but still answering looks healthy to every rule we had. Lowering the timeout doesn't fix it: a long answer can take 30-60 s, so a timeout can't tell slow from stuck.
 
 ### R2. Each provider gets at most 600 of the 1,000 connections (a bulkhead)
 - **What:** `max_connections_per_provider` in `config.yaml` (default 60% of `max_connections`). When a provider has that many requests open, the next request to it fails at once with a new kind, `provider_full`, and the gateway moves on to the next target. It never counts against the provider's breaker: it's our cap, not its fault. If no target has room, the client gets 503 `gateway_overloaded` with `Retry-After: 1`.
@@ -994,7 +930,6 @@ One copy, one CPU, final build. "+" is over the mock alone (non-streamed p50 1,0
 - **No waiting:** the total limit waits up to 1 s for a free connection; the per-provider limit doesn't wait at all. There's somewhere else to go, and waiting on a slow provider is what we're avoiding.
 - **Why 600:** it leaves 400 connections for the other providers. One provider alone can still use 600, which at 1.08 s per answer is ~550 requests/s, above what one copy's CPU can serve (Q6), so a single-provider model loses nothing.
 - **Alternatives:** separate pools per provider, each sized in the config (same effect, more to configure and get wrong); a weighted share per provider (not needed with 2-4 providers).
-- **Production terms:** *bulkhead*, from ship hulls split into compartments so one leak doesn't sink the ship.
 
 ### R3. A slow answer counts as a failure for the breaker
 - **What:** if a provider made us wait more than `slow_call_s` (10 s), its breaker records a failure, though the client still gets that answer. Five in a row and the breaker opens, so traffic goes to the fallback until a trial request comes back fast. On the dashboard it shows as outcome `slow`.
@@ -1076,7 +1011,6 @@ Same runs, final build, success rate while `mock` was broken:
   - don't cache answers to questions that contain numbers;
   - a judge prompt that says numbers and actions must match (not tried: it's tuning on this test, the overfitting O9 warned about);
   - per-intent caching from the team's own labels.
-- **Production terms:** *workload characterisation*, *hit rate vs cost reduction*, *verifier cost*, *precision against noisy labels*.
 
 ## T. Managing teams and keys
 
@@ -1087,7 +1021,7 @@ Same runs, final build, success rate while `mock` was broken:
   - one runaway service spending a whole team's budget;
   - the platform team as a bottleneck for every change;
   - spend that overshoots a budget because cost is known only after an answer.
-- **What Phase 3 already had:** hashed keys with a visible prefix, revocation within 60 s, fail-closed auth, a least-privilege database user, an append-only ledger priced by the model that actually answered, and per-team limits and budgets.
+- **What was already there:** hashed keys with a visible prefix, revocation within 60 s, fail-closed auth, a least-privilege database user, an append-only ledger priced by the model that actually answered, and per-team limits and budgets.
 - **Compared with:** LiteLLM's proxy (organisations, teams, users and keys, each with budgets; allowed models per key; an admin UI), Portkey (budgets and limits on keys, metadata for cost reports) and OpenAI's own Projects (project keys, per-project limits). This section adds the pieces that matter most and leaves out the ones that are mostly product surface (T5).
 - **Where each setting lives:** a team's policy (its limits, budget, allowed models) in `config.yaml`, reviewed like code. A key's settings in Postgres with the key, changed by the admin tool without a restart, and reaching every gateway copy within a minute through the key cache.
 

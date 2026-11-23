@@ -1,308 +1,223 @@
-# LLM Gateway — System Design (your working doc)
+# switchboard: system design
 
-> Fill this in **before** you build each component. Write your answer, then we review it together.
-> It's fine to be wrong at first. Revise the answer once you've measured.
-> Each section ends with a **Decision** and a **Tradeoff** line. Those two lines are your interview answer.
+The problem, the requirements, the numbers behind them, and the shape of the system. Each section ends with the decision and what it costs. The full reasoning for every choice, with the alternatives, is in [DECISIONS.md](DECISIONS.md).
 
 ---
 
-## Problem statement (framework Steps 1–3)
+## Problem
 
-**Context:** About 20 internal dev teams call LLM providers directly from their backend services. Today:
-- (a) a provider outage took our support bot down for 2 hours;
-- (b) nobody can tell which team is driving a bill that grew 4×;
-- (c) one team's runaway script used up the shared rate limit and broke every other team.
+About 20 internal teams call LLM providers directly from their backend services. Today:
+- a provider outage took the support bot down for 2 hours;
+- nobody can tell which team is driving a bill that grew 4×;
+- one team's runaway script used up the shared rate limit and broke every other team.
 
-**Problem:** Build an LLM gateway that takes a chat request plus a team API key, routes it to one of several providers (OpenAI, Anthropic, local Ollama), and returns the response.
+switchboard takes a chat request plus a team API key, routes it to one of several providers (OpenAI, Anthropic, Groq, local Ollama), and returns the response.
 
-**Success:**
-- No client errors when any single provider is down
-- 100% of requests attributed to a team
+**Success means:**
+- no client errors when any single provider is down
+- every request attributed to a team
 - LLM cost down 30% without hurting quality
-- Gateway overhead under 20 ms
+- gateway overhead under 20 ms
 
-**Scale:** about 50 RPS average, about 300 RPS at peak. A typical request is about 1,500 input and 300 output tokens. Raw prompts must not be logged (PII).
+**Scale:** about 50 requests/s on average and 300 at peak. A typical request is about 1,500 input and 300 output tokens. Raw prompts must never be logged (they contain customer PII).
 
-### Functional requirements (Step 4)
+### Functional requirements
 
-1. Accept a chat request and return the LLM's response.
-2. Authenticate every request with a team API key, and enforce what that team is allowed to use (models, budget).
-3. Route the request to the desired provider or model.
-4. Fall back to another provider when one is unavailable or returns errors.
-5. Support streaming responses (the support bot needs them).
-6. Trace every request: which team sent it, which provider served it, latency, and tokens used.
+1. Accept a chat request and return the LLM's response, in OpenAI's format.
+2. Authenticate every request with a team API key, and enforce what that team may use (models, budget).
+3. Route the request to the right provider and model.
+4. Fall back to another provider when one is unavailable or failing.
+5. Stream responses.
+6. Record every request: team, provider, latency, tokens, cost.
 7. Rate-limit each team so one broken script can't take down everyone else.
 8. Cache responses to cut cost and latency.
-9. Route cheaper requests to cheaper models when that's good enough, to cut cost.
+9. Send easy requests to cheaper models.
 
-### Non-functional requirements (Step 4)
+### Non-functional requirements
 
 | Area | Requirement |
 |------|-------------|
-| Latency | Gateway adds < 20 ms overhead |
-| Scale | Handle 50 RPS average and 300 RPS peak |
-| Availability | No client errors when any single provider is down; 99.9% uptime (~43 min of downtime per month) |
+| Latency | Gateway adds < 20 ms |
+| Scale | 50 requests/s average, 300 peak |
+| Availability | No client errors when any single provider is down; 99.9% uptime (~43 min of downtime a month) |
 | Cost | LLM bill down 30% without hurting quality |
-| Privacy | Never store or log raw prompts (they contain customer PII) |
+| Privacy | Never store or log raw prompts |
 
-### Estimations (Step 5)
+### Estimates
 
 | Quantity | Calculation | Result |
 |----------|-------------|--------|
-| Requests/day | 50 RPS × ~100k s/day | ~5M |
+| Requests/day | 50/s × ~100k s/day | ~5M |
 | Input tokens/day | 5M × 1,500 | 7.5B |
 | Output tokens/day | 5M × 300 | 1.5B |
-| Input cost/day (assume $3/M) | 7,500 × $3 | $22,500 |
-| Output cost/day (assume $15/M) | 1,500 × $15 | $22,500 |
+| Input cost/day (at $3/M) | 7,500 × $3 | $22,500 |
+| Output cost/day (at $15/M) | 1,500 × $15 | $22,500 |
 | **Total cost** | | **~$45k/day ≈ $1.35M/month** |
 | Value of the 30% target | | **~$400k/month** |
-| Concurrent requests at peak (Little's Law) | 300 RPS × 5 s | **1,500 in flight** |
-| …when the provider slows to 20 s | 300 RPS × 20 s | **6,000+ in flight** |
+| Requests in flight at peak (Little's Law) | 300/s × 5 s | **1,500** |
+| ...when the provider slows to 20 s | 300/s × 20 s | **6,000+** |
 
-**What the numbers tell us:**
-- Output tokens are about 1/6 of the volume but half the cost. Cheaper models and `max_tokens` limits are big levers.
-- The gateway mostly *waits*. It holds 1,500+ open requests, so it needs async I/O, not a thread per request.
-- A **slow** provider is more dangerous than a dead one. Waiting requests pile up until the gateway runs out of connections, file descriptors and memory, and then it fails for everyone, including teams using healthy providers (a cascading failure). We need protection against this (Phase 2).
+What the numbers say:
+- Output tokens are a sixth of the volume but half the cost. Cheaper models and `max_tokens` limits are the big levers.
+- The gateway mostly waits. It holds 1,500+ open requests, so it needs async I/O, not a thread per request.
+- A slow provider is more dangerous than a dead one. Waiting requests pile up until the gateway runs out of connections, and then it fails for everyone, including teams on healthy providers. The chaos test confirmed this (section 9).
 
 ---
 
-## 0. High-level architecture
+## 1. Architecture
 
-**Deployment view.** The gateways are stateless copies, and shared state lives in Redis:
+The gateway copies are stateless. Shared state lives in Redis and Postgres:
 
 ```
-            ┌── gateway #1 ──┐
-client → LB ┼── gateway #2 ──┼──► Redis (own machine, same data center: ~0.5 ms)
-            └── gateway #3 ──┘
-                    │
-                    ▼
-            OpenAI / Anthropic / Ollama
+                 ┌── gateway #1 ──┐      Redis        rate-limit buckets, spend totals
+client → nginx ──┼── gateway #2 ──┼───►  Redis (2nd)  cached answers, evicts when full
+                 └── gateway #3 ──┘      Postgres     keys, usage ledger, audit log
+                         │
+                         ▼
+             OpenAI / Anthropic / Groq / Ollama
 ```
 
-**Request path inside one gateway:**
+Inside one copy, every request goes through:
 
 ```
-Client → [Auth] → [Rate limit] → [Cache] ─hit─► return
-                                    │miss
-                                    ▼
-                                 [Router] → provider ─fail─► fallback provider
-                                    │
-                                    ▼
-                              save to cache → Client
-
-(tracing and metrics on every step; never log raw prompts)
+auth → rate limit → budget → cache ─hit─► return
+                               │ miss
+                               ▼
+                            router → provider ─fail─► fallback provider
+                               │
+                               ▼
+                       record usage, save to cache → client
 ```
 
-- **Auth comes first.** Until then we don't know which team sent the request. Also, serving cache hits before auth would hand cached answers to anyone.
-- **The rate limiter comes after auth.** It counts per team, so it needs to know the team.
-- **The rate limiter comes before the cache.** A broken script sending the same cached request 50k times per second would still overload the gateway and Redis.
-  - *(open: should cache hits count against a team's LLM budget? Maybe two limits in two places?)*
-- **The router decides; it doesn't load-balance.** It picks the model and provider, and what to try next on failure. The real load balancer sits in front of the gateway copies.
-- **Redis isn't on the gateway machine.** There are 3 copies, so which machine would it live on? And one machine dying would take the cache with it. It must still be in the same data center, because a cross-region call (~80 ms) breaks the 20 ms budget.
+- **Auth first.** Until then we don't know the team, and serving cache hits before auth would hand cached answers to anyone.
+- **Rate limit before the cache.** A broken script sending the same cached request 50k times a second would still overload the gateway and Redis.
+- **The router decides; it doesn't load-balance.** It picks the model and provider, and what to try next. nginx balances across the copies.
+- **Redis is separate from the gateway machines** but in the same data center: a cross-region call (~80 ms) would break the 20 ms budget on its own.
 
-**Decision:** stateless gateway copies behind a load balancer, with shared state (cache and rate-limit counters) in Redis.
-**Tradeoff:** Redis becomes a dependency on every request, so we must decide what happens when it's down. *(open)*
+**Decision:** stateless copies behind a load balancer, with shared state in Redis and Postgres.
+**Cost:** Redis is on every request's path, so each use of it needs a rule for when it's down (section 5).
 
 ---
 
-## 1. API contract
+## 2. API contract
 
-- Which OpenAI request fields will you support in v1, and which will you reject or ignore?
-- What does an error response look like? (Match OpenAI's error shape?)
-- Which custom headers will you add (request ID, cache status, provider)?
-- How does a client opt into the semantic cache? (A header? An extra body field?)
+- `POST /v1/chat/completions`, streamed or not, in OpenAI's format. Fields the gateway doesn't model are passed through to the provider, so the OpenAI SDK works unchanged.
+- Errors use OpenAI's shape (`{"error": {"message", "type", "code"}}`), so SDK retry logic works too.
+- Response headers say what happened: `x-request-id`, `x-gateway-provider`, `x-gateway-cache`, `x-gateway-attempts`, rate-limit and budget headers.
+- Clients opt into extras with headers: `x-gateway-cache`, `x-gateway-fallback`, `x-gateway-tags`.
 
-**Decision:**
-**Tradeoff:**
-
----
-
-## 2. Provider adapters
-
-- Write out the interface every provider must implement.
-- How does an OpenAI-format request map to the Anthropic Messages format? (System prompt, roles, `max_tokens`, stop sequences.)
-- How do Anthropic stream events map back to OpenAI chunks?
-- How do you normalize `usage` (token counts) across providers?
-
-**Decision:**
-**Tradeoff:**
+**Decision:** be a drop-in replacement for the OpenAI API (DECISIONS.md C, U).
+**Cost:** every message shape OpenAI accepts has to be accepted here too, including images and tool calls.
 
 ---
 
-## 3. Streaming
+## 3. Providers
 
-- **The relay is a pipe with a window.** Each SSE line is forwarded to the client the moment it arrives. While it passes, the gateway records TTFT (the first content chunk) and `usage` (the last chunk).
-- **Usage in streams:** OpenAI only sends `usage` when `stream_options.include_usage=true`, so the gateway always sets it. Without it, cost tracking can't see streamed requests.
-- **Fails before the first chunk:** check the upstream status *before* opening the stream. An error becomes a normal error response with the provider's status code. This is the only point where retry or fallback is possible.
-- **Fails after the first chunk:** the 200 and part of the answer are already sent, and a restarted answer from another provider would be glued on and garbled. So: send `data: {"error": ...}` (the OpenAI SDK raises `APIError`), no `[DONE]`, and the client decides whether to retry.
-- **Client disconnects:** the server cancels the relay. The usage logging lives in `finally:`, so it still runs. Before that fix, 1 in 10 streams lost its usage. If the client leaves before `usage` arrives, we log `usage=None`. *(open: estimate the tokens? decide with budgets)*
-- **Unknown fields** (`top_p`, `tools`, …) are kept (`extra="allow"`). Pydantic drops them by default, which would break the drop-in promise.
+Anything that speaks OpenAI's API (OpenAI, Groq, Ollama, vLLM) needs only a config entry. Anthropic is translated by an adapter: system prompt, roles, `max_tokens`, stop sequences on the way out; stream events and usage on the way back. Routing, fallback and circuit breaking only ever see OpenAI's format.
 
-**Decision:** pass the stream through unchanged; fall back only before the first byte; after that, report errors in the stream.
-**Tradeoff:** a mid-stream failure reaches the client as an error rather than being hidden. That's honest and protocol-compatible, but the client has to handle the retry.
+**Decision:** one canonical format, with provider differences kept in adapters at the bottom of the call path (DECISIONS.md I).
+**Cost:** features one provider lacks (Claude has no `tools` here) mean skipping that provider for those requests.
 
 ---
 
-## 4. Reliability: timeouts, retries, circuit breaker, fallback
+## 4. Streaming
 
-**The core split: is it the request's fault or the provider's?** Another provider can't fix a broken request, but it *can* answer when one provider is having trouble.
+- Each SSE chunk goes to the client as soon as it arrives. On the way through, the gateway records TTFT (first content chunk) and usage (last chunk). It always asks OpenAI for usage, and removes it again if the client didn't ask.
+- **Commit point:** the gateway waits for the provider's first chunk before sending `200`. Until then it can still fall back silently.
+- **After the first chunk**, the answer can't be restarted elsewhere without garbling it. A failure becomes an error event and the client decides whether to retry.
+- **Client disconnects:** usage logging runs in `finally:`, so it still happens.
+
+**Decision:** pass the stream through, fall back only before the first chunk, report later errors in the stream (DECISIONS.md D).
+**Cost:** a mid-stream failure reaches the client as an error rather than being hidden.
+
+---
+
+## 5. Reliability
+
+**The core split: is it the request's fault or the provider's?** Another provider can't fix a broken request, but it can answer when one provider is in trouble.
 
 | Failure | Action | If nothing is left | Why |
 |---|---|---|---|
-| `400` and other request errors | Return to the client as-is | | Broken everywhere. Falling back would hide the client's bug. |
-| `401` / `403` | Fall back, log at **ERROR** | **502** | It's *our* provider key. Passing 401 through would make the client debug their own (valid) key. |
-| `429` | Fall back immediately, no retry | **503** + `Retry-After` | The limit is shared by all teams. Retrying in lockstep causes a retry storm; falling back relieves the provider. |
-| `5xx` | Fall back immediately | Retry once (100–300 ms jitter), then **502** | Often a brief glitch. Retry only when there's no alternative. |
-| Connect error or timeout | Same as 5xx | Retry once, then **502** | The request never reached the provider, so a retry is safe. |
-| Read timeout | Fall back, **never retry** | **504** | The provider has the request and may still be working on it (and billing us). Retrying a slow provider piles on load (cascading failure). |
-| `x-gateway-fallback: off` | Only the first target is tried | | **Opt-out**, on by default, so every team is protected without reading the docs. Teams that need an exact model (evals) can turn it off. |
-
-**Timeouts:**
+| `400` and other request errors | Return as is | | Broken everywhere. Falling back would hide the client's bug. |
+| `401` / `403` | Fall back, log at ERROR | **502** | It's our provider key. Passing 401 through would make the client debug their own valid key. |
+| `429` | Fall back, no retry | **503** + `Retry-After` | Retrying in lockstep causes a retry storm. |
+| `5xx` | Fall back | Retry once with jitter, then **502** | Often a brief glitch. Retry only when there's no alternative. |
+| Connect error | Same as 5xx | Retry once, then **502** | The request never arrived, so a retry is safe. |
+| Read timeout | Fall back, **never retry** | **504** | The provider may still be working on it, and billing us. Retrying piles on load. |
 
 | Timeout | Value | Why |
 |---|---|---|
 | Connect | 3 s | Reaching a server takes milliseconds |
-| Stream: first chunk | 10 s | Normally about 1 s, and until the first chunk we can still fall back |
-| Stream: gap between chunks | 30 s | A long silence mid-stream means it's stuck (error event; no fallback possible) |
-| Non-stream: whole answer | 60 s | Nothing arrives until the end, so we can't tell "slow" from "long". That's the cost of not streaming. |
+| Stream: first chunk | 10 s | Normally ~1 s, and until then we can still fall back |
+| Stream: gap between chunks | 30 s | A long silence mid-stream means it's stuck |
+| Non-stream: whole answer | 60 s | Nothing arrives until the end, so slow and long look the same |
 
-- **Read ahead before committing.** For a stream, the gateway waits for the provider's first chunk *before* sending `200` to the client. Committing on the provider's headers alone would make fallback impossible if the provider then went silent.
-- **Visibility.** `x-gateway-attempts: openai:server, ollama:connect` is on every response that needed fallback, and every attempt is listed in the final error body.
-- **Not done yet (deliberately):** fallbacks for specific 400s (context window too small, content policy), like LiteLLM's `context_window_fallbacks`. These are v2.
+- **Circuit breaker** per provider-and-model: 5 failures in a row open it, and the model is skipped. After 30 s, one trial request goes through. State is per copy, not shared: 3 copies learning separately waste 15 requests instead of 5, which isn't worth a Redis round trip on every request (DECISIONS.md G).
+- **Bulkhead:** each provider may use at most 600 of the 1,000 connections. A slow call (over 10 s) counts as a breaker failure even if it succeeds (DECISIONS.md R).
+- **Load shedding:** when a copy's own work starts taking over 100 ms, it refuses new requests with a fast 503 instead of queueing them (DECISIONS.md Q).
+- **If Redis is down:** rate limits are enforced per copy, budgets aren't checked (spend is still recorded), and the cache is a miss. **If Postgres is down:** keys already cached keep working; new ones are rejected. Fail closed on security, fail open on protection.
 
-**Decision:** classify every failure by whose fault it is. Fall back on provider problems, return request errors as they are, and retry only on the last option and only when it's safe.
-**Tradeoff:** a fallback can return a different model than the client named. That's reduced by the opt-out and by always reporting the real provider.
-
-- Circuit breaker: what trips it, how long it stays open, how half-open works. Is its state per instance or shared in Redis? *(open: step 2c)*
-
----
-
-## 5. Auth, rate limiting, budgets
-
-- Where are API keys stored, and how are they looked up?
-- Algorithm: token bucket, fixed window, or sliding window? Why?
-- How do you make check-and-decrement atomic across N gateway replicas?
-- Requests/min and tokens/min: how do you limit tokens when you don't know the output length up front?
-- Budget: reserve, then reconcile. Write out the exact steps.
-- **If Redis is down:** fail open or fail closed? Decide separately for rate limits, budgets, and the cache.
-
-**Decision:**
-**Tradeoff:**
+**Decision:** classify every failure by whose fault it is; fall back on the provider's, return the client's, retry only when safe and nothing else is left.
+**Cost:** a fallback can answer with a different model than the client named. Clients can turn fallback off, and the real provider is always reported.
 
 ---
 
-## 6. Caching
+## 6. Keys, rate limits, budgets
 
-**Exact cache**
+- **Keys:** Postgres stores a SHA-256 hash, never the key. Each copy caches lookups for 60 s. A key can carry its own limits, budget and expiry inside its team's, and is rotated with a grace period (DECISIONS.md J, T).
+- **Rate limits:** token buckets in Redis, requests per minute and tokens per minute, per team and per key. All the buckets are checked and charged in one Lua script, so two copies can't spend the same token. Tokens are estimated before the call and settled from the provider's usage report after (DECISIONS.md K).
+- **Budgets:** every request is priced by the model that answered and written to an append-only ledger in Postgres, in whole micro-dollars. Redis keeps a running total per team and key, rebuilt from the ledger if lost (DECISIONS.md L).
+- **The gateway's database user** can read keys, insert usage rows, and update one column. It can't create keys or change spend (DECISIONS.md M).
 
-*Flow (cache-aside):*
-```
-GET key → value found → cache HIT  → return it
-        → (nil)       → cache MISS → call LLM → SET key answer → return it
-```
-- The cache lives in **Redis**, outside the gateway. With several gateway replicas behind a load balancer, every replica sees the same cache. That keeps the gateway servers stateless.
-- Whether you save before or after sending doesn't prevent a cache stampede. Identical requests that arrive while the first LLM call is still running all miss either way. (How to solve the stampede is still open.)
-
-*Key design. Anything that changes the answer must be in the key:*
-
-| Part | Why it's in the key |
-|------|---------------------|
-| tenant | Tenant B must never get Tenant A's answer (isolation) |
-| model | A request for the strong model must not get the cheap model's cached answer |
-| temperature | Changes how the model writes |
-| max_tokens | Can cut the answer short |
-| all messages (system + user + assistant) | The system prompt changes the answer a lot ("pirate" vs "lawyer"), not just the last prompt |
-
-- The raw key could be huge (a pasted 300-page document), so **hash it with SHA-256**. The output is a fixed 64 characters, and a one-character change in the input gives a completely different hash.
-- Keep fields you need to search or group by **readable, outside the hash**. Example: deleting all of a tenant's data when they leave.
-
-```
-cache:<tenant>:<sha256(model + temperature + max_tokens + messages)>
-e.g. cache:tenantA:9f3a7c...
-```
-
-- What must **never** be cached? *(open: the temperature=1.0 poem question)*
-- **TTL** (`SET key value EX <seconds>`): entries delete themselves, which handles both stale answers and the cache filling up.
-  - Tradeoff: a short TTL means fresher data but more misses (more cost). A long TTL means more hits but stale answers. Choose it based on how often the data changes.
-  - *(open, decide when we build the cache: per-tenant TTL? event-based invalidation? who tells the gateway?)*
-
-**Semantic cache**
-- Which embedding model? Local or an API? What latency and cost does it add?
-- What is scoped into the lookup (tenant, model, system prompt, params)?
-- How will you pick the threshold? Describe the evaluation set and the metric.
-- How do you stop wrong answers from being served?
-
-**Decision:**
-**Tradeoff:**
+**Decision:** Redis for the per-request checks, Postgres as the source of truth.
+**Cost:** a budget can overshoot by the requests already in flight when it runs out.
 
 ---
 
-## 7. Routing / cascade
+## 7. Caching
 
-- What does `model="auto"` mean exactly? Which cheap and strong models?
-- What counts as a validation failure? (Give concrete checks.)
-- How does a cascade interact with streaming? (Can you validate before streaming?)
-- How do you measure whether the cascade is actually worth it?
+**Exact cache.** Cache-aside in its own Redis, which evicts the least-used answers when full, so cached answers never push out rate-limit data. The key is `cache:<team>:<sha256(model, parameters, all messages)>`: anything that changes the answer is in the key, and teams never share entries. Off unless the team asks, because a cached "write a poem" never gives a new poem. Only complete first-choice answers are stored (DECISIONS.md N).
 
-**Decision:**
-**Tradeoff:**
+**Semantic cache.** For a new question, embed it with `text-embedding-3-small`, find the closest stored question with the same model, system prompt and parameters, and ask gpt-4o-mini whether the two mean the same thing. A similarity threshold alone isn't safe: real paraphrases scored 0.58–0.87, while near-misses like "refund *after* 30 days" vs "*within* 30 days" scored up to 0.96. Shadow mode runs the lookup without serving it, so a team can measure it first. Any slow or failed step is a miss (DECISIONS.md O).
 
----
-
-## 8. Observability
-
-List every metric: name, type (counter, histogram, gauge), and labels.
-
-| Metric | Type | Labels | Why |
-|--------|------|--------|-----|
-|        |      |        |     |
-
-- Which labels would cause a cardinality explosion?
-- What would you alert on, and at what thresholds?
-- What goes in the logs? What must never go in them?
-
-**Decision:**
-**Tradeoff:**
+**Decision:** exact first, then embedding search to find a candidate and an LLM judge to decide.
+**Cost:** the judge adds ~0.7 s to candidates, and still makes mistakes: 4.2% of hits in the replay (DECISIONS.md S).
 
 ---
 
-## 9. Load testing
+## 8. Routing
 
-- What exactly are you measuring? (Gateway overhead vs end-to-end.)
-- How does the mock provider behave (latency distribution, error rate, streaming)?
-- What test scenarios will you run (steady load, spike, provider outage, cache-heavy)?
-- What's the bottleneck likely to be, and how will you confirm it?
+`model: "auto"` sends a request to gpt-4o-mini, and upgrades to gpt-4o if it offers tools, has 6+ user messages, or has 3,000+ prompt tokens. A router decides before calling anything; a cascade (cheap model, judge, escalate) would add a judge call to every request and hold back the stream. Shadow mode also sends 5% of `auto` requests to the other model, and an offline judge compares the two answers, which gives the data to tune the rules later (DECISIONS.md P).
 
-**Decision:** overhead, measured open-loop with k6 against a mock provider with a fixed delay; one gateway copy on one CPU; py-spy to find the cause of each limit. Details in DECISIONS.md Q.
+**Decision:** rules now, a trained classifier once there's labelled data.
+**Cost:** rules only guess from the request; shadow mode measures how often they guess wrong.
 
-**Results** (one copy, one CPU; added latency over the mock; 0 errors in every run; full table in DECISIONS.md Q6):
+---
 
-| Scenario | RPS | Shed | p50 | p99 |
+## 9. Measured results
+
+Load tests run open-loop with k6 against a mock provider with a fixed delay, so any added latency is the gateway's. One copy on one CPU, with py-spy for profiles (DECISIONS.md Q):
+
+| Scenario | Requests/s | Shed | p50 | p99 |
 |----------|-----|------|-----|-----|
 | Non-streamed | 300 | 0 | +2 ms | +97 ms |
 | Non-streamed | 500 | 5% | +5 ms | +308 ms |
 | Streamed, time to first token | 200 | 5% | +9 ms | +245 ms |
 | Exact cache hits, total | 800 | 3% | 1.0 ms | 160 ms |
 
-**The bottleneck:** first httpx's default pool of 100 connections (~90 RPS), then httpcore's O(n²) pool bookkeeping (88% of the CPU at 150 RPS). After both fixes the profile is flat: the remaining cost is the async Python stack itself.
+**Bottlenecks found:** httpx's default pool of 100 connections (~90 requests/s), then httpcore's pool bookkeeping, which grows with the square of open connections (88% of the CPU at 150 requests/s). Provider calls now go through aiohttp: about 3× the throughput.
 
-**Provider outage** (100 RPS, first-choice provider broken for 60 s, DECISIONS.md R): killed or returning 500s, 100% of requests succeeded through the fallback. Slow (20 s per answer), only 60% did at first: slow answers counted as successes and took the whole connection pool. After a per-provider connection cap and counting slow answers as breaker failures, 100%.
+**Provider outage** (100 requests/s, first-choice provider broken for 60 s, DECISIONS.md R): killed or returning 500s, 100% of requests succeeded through the fallback. Slow (20 s per answer), only 60% did at first: slow answers counted as successes and took the whole connection pool. With the bulkhead and slow-call breaker, 100%.
 
----
-
-## 10. Scaling and failure scenarios (interview drill)
-
-Answer each one in 3–5 sentences:
-
-1. Traffic goes up 20×. What breaks first?
-2. Redis goes down.
-3. OpenAI is degraded: slow, but not erroring.
-4. One tenant sends a burst of 10k requests.
-5. A provider fails halfway through a stream.
-6. You need to add a new provider. What changes in the code?
+**Cache replay** (1,000 support questions, DECISIONS.md S): 57% semantic hits, 38% lower cost after paying for the embedding and judge calls.
 
 ---
 
-## 11. Decision log
+## 10. Failure scenarios
 
-All decisions, with alternatives, pros and cons, production terms, and reading: see **[DECISIONS.md](DECISIONS.md)**.
+- **Traffic goes up 20×.** Add copies; they're stateless. Redis is next: one Lua script per request is cheap, but it's a single instance. Past that, shard buckets by team.
+- **Redis goes down.** Rate limits fall back to each copy's share, budget checks pause, the cache misses. Requests keep flowing.
+- **A provider is slow but not failing.** The bulkhead caps its connections, and the slow-call breaker moves traffic to the fallback after five slow answers.
+- **One team sends 10k requests at once.** Its bucket empties and it gets 429s with `Retry-After`; other teams are untouched.
+- **A provider fails mid-stream.** The client gets an error event, not a truncated answer that looks complete.
+- **A new provider.** If it speaks OpenAI's API, a config entry. Otherwise, one adapter.

@@ -1,4 +1,4 @@
-"""Phase 2b: the retry / fallback policy, one test per decision we made."""
+"""The retry / fallback policy, one test per decision we made."""
 import asyncio
 
 import httpx

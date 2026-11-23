@@ -1,4 +1,4 @@
-"""Phase 2d: Prometheus metrics. Metrics are global and add up across tests, so every test checks the change."""
+"""Prometheus metrics. Metrics are global and add up across tests, so every test checks the change."""
 import httpx
 import respx
 from prometheus_client import REGISTRY

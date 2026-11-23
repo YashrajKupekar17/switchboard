@@ -1,4 +1,4 @@
-"""Phase 2c: circuit breaker. Unit tests for the state machine, then end-to-end through the gateway."""
+"""Circuit breaker. Unit tests for the state machine, then end-to-end through the gateway."""
 import dataclasses
 
 import httpx

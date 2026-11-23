@@ -1,4 +1,4 @@
-"""Phase 3a: team API keys (DECISIONS.md section J)."""
+"""Team API keys (DECISIONS.md section J)."""
 import asyncio
 
 import httpx

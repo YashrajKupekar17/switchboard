@@ -162,7 +162,7 @@ def test_openai_sdk_raises_on_mid_stream_failure(client):
     assert received == ["Our refund policy"]
 
 
-# --- Phase 2a: config-driven routing ---
+# --- config-driven routing ---
 
 
 @respx.mock
